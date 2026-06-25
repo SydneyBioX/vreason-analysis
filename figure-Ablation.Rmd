@@ -1,0 +1,213 @@
+---
+title: "figure-Ablation"
+author: "Harry Robertson"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 14,
+  fig.height = 12,
+  dpi = 600
+)
+
+library(tidyverse)
+library(patchwork)
+library(scales)
+library(ggpubr)
+
+RESULTS <- "results"
+
+# Main-text figure: composite ablation panel.
+FIG_DIR  <- "main-figures"
+# Supplementary: per-metric ablation bar+CI panels.
+SUPP_DIR <- file.path("supp-figures", "ablation-figures")
+
+walk(c(FIG_DIR, SUPP_DIR),
+     ~ dir.create(.x, showWarnings = FALSE, recursive = TRUE))
+
+N_BOOT <- 10000
+SEED   <- 42
+
+source("./figure2-helpers.R")
+```
+
+```{r ablation-helpers}
+# Mirror Figure4.Rmd: extend the palette and bypass should_skip() so CoT and
+# vreason variants survive into the ablation comparisons.
+# NB: keep model_label as character downstream — radar_plot/bar_with_ci look up
+# colours via MODEL_PALETTE[unique(model_label)], and a factor would index by
+# integer code instead of name (collapsing Base+CoT and Base+VReason onto the
+# wrong palette slots). Alphabetical ordering of "Base", "Base + CoT",
+# "Base + VReason" already matches the desired sequence.
+
+MODEL_PALETTE <- c(
+  MODEL_PALETTE,
+  "Base"           = unname(MODEL_PALETTE[["Qwen2.5-VL 7B"]]),
+  "Base + CoT"     = unname(MODEL_PALETTE[["Qwen3-VL 8B"]]),
+  "Base + VReason" = unname(MODEL_PALETTE[["VReason"]])
+)
+
+ablation_label <- function(stem) {
+  case_when(
+    stem == "qwen2.5_vl_7b_instruct"     ~ "Base",
+    stem == "qwen2.5_vl_7b_instruct_cot" ~ "Base + CoT",
+    stem %in% c("vreason", "vreasson")   ~ "Base + VReason",
+    TRUE ~ model_label(stem)
+  )
+}
+
+load_ablation_per_sample <- function(directory) {
+  csvs <- list.files(directory, pattern = "\\.csv$", full.names = TRUE)
+  csvs <- csvs[!grepl("summary\\.csv$", csvs)]
+
+  frames <- map(csvs, function(p) {
+    stem <- tools::file_path_sans_ext(basename(p))
+    df <- read_csv(p, show_col_types = FALSE)
+    df$model       <- stem
+    df$model_label <- ablation_label(stem)
+    df
+  })
+  bind_rows(frames)
+}
+```
+
+```{r ablation-data}
+RG_RADAR_METRICS <- c(
+  "bleu1", "bleu2", "bleu4",
+  "meteor", "rougel", "cider",
+  "bertscore", "semb_score", "radgraph_combined",
+  "CE_precision",  "CE_recall",  "CE_f1",
+  "CE5_precision", "CE5_recall", "CE5_f1"
+)
+ABL_RG_BAR_METRICS <- c("bleu4", "meteor", "rougel",
+                        "bertscore", "semb_score", "radgraph_combined")
+VQA_METRICS <- c("exact_match", "contains_match", "token_recall", "token_f1")
+
+abl_mimic_ps      <- load_ablation_per_sample(file.path(RESULTS, "ablation/rg/mimic_cxr"))
+abl_mimic_summary <- build_summary(abl_mimic_ps, RG_RADAR_METRICS)
+abl_mimic_boot    <- compute_boot_cis(abl_mimic_ps, ABL_RG_BAR_METRICS)
+
+abl_iu_ps      <- load_ablation_per_sample(file.path(RESULTS, "ablation/rg/iu_xray"))
+abl_iu_summary <- build_summary(abl_iu_ps, RG_RADAR_METRICS)
+abl_iu_boot    <- compute_boot_cis(abl_iu_ps, ABL_RG_BAR_METRICS)
+
+abl_vqa_ps   <- load_ablation_per_sample(file.path(RESULTS, "ablation/vqa/slake"))
+abl_vqa_boot <- compute_boot_cis(abl_vqa_ps, VQA_METRICS)
+```
+
+```{r supp-helpers}
+make_supp_panels <- function(boot_df, metric_specs, supp_dir,
+                             y_limits = c(0, 1)) {
+  imap(metric_specs, function(metric, figure_name) {
+    p <- bar_with_ci(boot_df, metric) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    if (!is.null(y_limits)) {
+      p <- p + scale_y_continuous(limits = y_limits,
+                                  breaks = seq(y_limits[1], y_limits[2], 0.2))
+    }
+    ggsave(file.path(supp_dir, paste0(figure_name, ".pdf")),
+           plot = p, width = 5, height = 4, device = "pdf")
+    p
+  })
+}
+
+save_supp_arranged <- function(plots, filename, supp_dir,
+                               ncol, nrow, width, height) {
+  arr <- ggarrange(plotlist = plots, ncol = ncol, nrow = nrow,
+                   common.legend = TRUE, legend = "bottom")
+  ggsave(file.path(supp_dir, filename),
+         plot = arr, width = width, height = height, device = "pdf")
+  arr
+}
+```
+
+# Supplementary panels — RG ablation (MIMIC-CXR + IU X-ray) and VQA ablation
+
+```{r supp-mimic-rg}
+mimic_specs <- c(
+  figure4a_mimic_bleu4    = "bleu4",
+  figure4b_mimic_meteor   = "meteor",
+  figure4c_mimic_rougel   = "rougel",
+  figure4d_mimic_bert     = "bertscore",
+  figure4e_mimic_semb     = "semb_score",
+  figure4f_mimic_radgraph = "radgraph_combined"
+)
+mimic_plots <- make_supp_panels(abl_mimic_boot, mimic_specs, SUPP_DIR)
+save_supp_arranged(mimic_plots, "figure4a-f.pdf", SUPP_DIR,
+                   ncol = 3, nrow = 2, width = 9, height = 7)
+```
+
+```{r supp-iu-rg}
+iu_specs <- c(
+  figure4g_iu_bleu4    = "bleu4",
+  figure4h_iu_meteor   = "meteor",
+  figure4i_iu_rougel   = "rougel",
+  figure4j_iu_bert     = "bertscore",
+  figure4k_iu_semb     = "semb_score",
+  figure4l_iu_radgraph = "radgraph_combined"
+)
+iu_plots <- make_supp_panels(abl_iu_boot, iu_specs, SUPP_DIR)
+save_supp_arranged(iu_plots, "figure4g-l.pdf", SUPP_DIR,
+                   ncol = 3, nrow = 2, width = 9, height = 7)
+```
+
+```{r supp-vqa}
+vqa_specs <- c(
+  figure4m_vqa_exact_match    = "exact_match",
+  figure4n_vqa_contains_match = "contains_match",
+  figure4o_vqa_token_recall   = "token_recall",
+  figure4p_vqa_token_f1       = "token_f1"
+)
+vqa_plots <- make_supp_panels(abl_vqa_boot, vqa_specs, SUPP_DIR)
+save_supp_arranged(vqa_plots, "figure4m-p.pdf", SUPP_DIR,
+                   ncol = 2, nrow = 2, width = 8, height = 7)
+```
+
+# Main figure — Ablation composite
+
+```{r figure-Ablation-main, fig.width=14, fig.height=12}
+p_abl_mimic <- radar_plot(
+  abl_mimic_summary,
+  RG_RADAR_METRICS,
+  title = "MIMIC-CXR (RG ablation)",
+  axis_limits = MIMIC_CXR_RADAR_LIMITS,
+  label_size = 2.6,
+  grid_label_size = 2.1
+)
+
+ggsave(file.path(FIG_DIR, "figure4-mimic-cxr-ablation-radar.pdf"),
+       plot = p_abl_mimic, width = 7, height = 7, device = "pdf")
+
+p_abl_iu <- radar_plot(abl_iu_summary, RG_RADAR_METRICS,
+                          title = "IU X-ray (RG ablation)")
+
+rg_row <- (p_abl_mimic + p_abl_iu) +
+  plot_layout(ncol = 2, guides = "collect") &
+  theme(legend.position = "bottom")
+
+vqa_row <- ggarrange(plotlist = vqa_plots, ncol = 4, nrow = 1,
+                     common.legend = TRUE, legend = "bottom")
+
+figure_ablation <- ggarrange(
+  rg_row, vqa_row,
+  ncol = 1, nrow = 2,
+  heights    = c(1.4, 1),
+  labels     = c("A", "B"),
+  font.label = list(size = 14, face = "bold")
+)
+
+ggsave(file.path(FIG_DIR, "figure-Ablation.pdf"),
+       plot = figure_ablation, width = 14, height = 12, device = "pdf")
+
+figure_ablation
+```

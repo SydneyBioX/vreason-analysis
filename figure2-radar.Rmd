@@ -1,0 +1,77 @@
+---
+title: "figure2-radar"
+author: "Harry Robertson"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 7,
+  fig.height = 7,
+  dpi = 600
+)
+
+library(tidyverse)
+library(patchwork)
+library(scales)
+
+RESULTS <- "results"
+FIG_DIR <- "main-figures"
+dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
+
+N_BOOT <- 10000
+SEED   <- 42
+
+source("./figure2-helpers.R")
+```
+
+```{r figure2-radar, fig.width=7, fig.height=7}
+RG_RADAR_METRICS <- c(
+  "bleu1",
+  "bleu2",
+  "bleu4",
+  "meteor",
+  "rougel",
+  "cider",
+  "bertscore",
+  "semb_score",
+  "radgraph_combined",
+  "CE_precision",
+  "CE_recall",
+  "CE_f1",
+  "CE5_precision",
+  "CE5_recall",
+  "CE5_f1"
+)
+
+rg_mimic_ps <- load_per_sample(file.path(RESULTS, "performance/rg/mimic_cxr"))
+rg_mimic_summary <- build_summary(rg_mimic_ps, RG_RADAR_METRICS)
+
+plot <- radar_plot(
+  rg_mimic_summary,
+  RG_RADAR_METRICS,
+  title = "MIMIC-CXR",
+  axis_limits = MIMIC_CXR_RADAR_LIMITS,
+  label_size = 2.6,
+  grid_label_size = 2.1
+)
+
+ggsave(
+  filename = file.path(FIG_DIR, "figure2-radar.pdf"),
+  plot = plot,
+  width = 7,
+  height = 7,
+  device = "pdf"
+)
+
+plot
+```

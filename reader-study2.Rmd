@@ -1,0 +1,443 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-06-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggpubr)
+library(scales)
+library(ggalluvial)
+source("./figure2-helpers.R")
+```
+
+```{r data loading}
+responses <- read_csv(file.path("~/Downloads/case_responses_rows.csv"))
+assignments <- read_csv(file.path("~/Downloads/user_case_assignments_rows.csv"))
+profiles <- read_csv(file.path("~/Downloads/profiles_rows.csv")) %>%
+  mutate(is_study_complete = as_bool_vec(is_study_complete))
+reviews <- read_csv(file.path("~/Downloads/finding_reviews_rows.csv"))
+cases <- read_csv(file.path("~/Downloads/cases_rows.csv"))
+detailed_case = read_csv(file.path("~/Downloads/per_response_detailed.csv"))
+```
+
+```{r data filtering}
+complete_user_ids <- profiles %>%
+  filter(is_study_complete %in% TRUE) %>%
+  pull(id)
+
+responses <- responses %>%
+  filter(user_id %in% complete_user_ids) %>%
+  mutate(interpret_time_seconds = as.numeric(interpret_time_seconds),
+    visual_confidence_boost = as_bool_vec(visual_confidence_boost))
+
+reviews <- reviews %>%
+  filter(user_id %in% complete_user_ids) %>%
+  mutate(is_accepted = as_bool_vec(is_accepted))
+
+resp <- responses %>%
+  left_join(assignments %>% select(assignment_id = id, presentation_mode, presentation_order),
+    by = "assignment_id") %>%
+  mutate(changed_decision = final_interpretation_source %in% c("ai_interpretation", "custom_interpretation"),
+    is_ai_assisted = presentation_mode == "ai_assisted",
+    time_minutes = interpret_time_seconds / 60)
+
+time_df_raw <- resp %>%
+  filter(!is.na(presentation_mode), presentation_mode %in% c("manual", "ai_assisted"), !is.na(interpret_time_seconds))
+
+decision_df <- resp %>% filter(!is.na(final_interpretation_source))
+review_df <- reviews %>% filter(!is.na(is_accepted))
+boost_df <- resp %>% filter(!is.na(visual_confidence_boost))
+case_difficulty <- cases %>% select(case_id = id, case_difficulty)
+```
+
+```{r time-plot}
+library(lme4)
+library(lmerTest)
+library(emmeans)
+time_df_p <- time_df_raw %>%
+  filter(interpret_time_seconds < 320) %>%
+  mutate(
+    participant = participant_name(user_id),
+    participant = factor(participant, levels = rev(part_order)) # Reader 1 at top
+  )
+
+# Overall (pooled across all readers) median time per mode.
+overall_time_median <- time_df_p %>%
+  group_by(presentation_mode) %>%
+  summarise(median_sec = median(interpret_time_seconds), .groups = "drop")
+
+model = lmerTest::lmer(interpret_time_seconds ~ presentation_mode + (1 | user_id) + (1 | case_id), data = time_df_p)
+summary(model)
+
+part_time_tbl <- time_df_p %>%
+  group_by(participant, presentation_mode) %>%
+  summarise(n = n(), mean_sec = mean(interpret_time_seconds),
+    median_sec = median(interpret_time_seconds), sd_sec = sd(interpret_time_seconds), .groups = "drop") %>%
+  mutate(presentation_mode = recode(as.character(presentation_mode), !!!MODE_LABEL))
+
+p_part_time <- ggplot(time_df_p, aes(participant, interpret_time_seconds, fill = presentation_mode)) +
+  geom_hline(data = overall_time_median, aes(yintercept = median_sec, colour = presentation_mode),
+    linetype = "dashed", size = 0.8) +
+  geom_boxplot(position = position_dodge(width = 0.85), alpha = 0.45, linewidth = 0.45,
+    outlier.shape = NA) +
+  geom_point(aes(colour = presentation_mode),
+    position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.72),
+    alpha = 0.62, size = 1.15) +
+  stat_summary(
+    aes(group = presentation_mode),
+    fun = mean, geom = "point",
+    position = position_dodge(width = 0.72),
+    shape = 23, size = 2.2, fill = "white") +
+  theme_bw() +
+  scale_y_continuous(breaks = seq(0,360,30)) +
+  scale_fill_manual(values = MODE_COLOR, labels = MODE_LABEL) +
+  scale_colour_manual(values = MODE_COLOR, labels = MODE_LABEL) +
+  labs(x = NULL, y = "Seconds") + coord_flip()
+```
+
+```{r figure-participant-decision-confidence, fig.width=9, fig.height=5.2}
+part_decision <- decision_df %>%
+  mutate(participant = participant_name(user_id)) %>%
+  group_by(participant) %>%
+  summarise(decision_cases = n(), changed = sum(changed_decision), .groups = "drop") %>%
+  mutate(change_rate_pct = pct(changed, decision_cases))
+
+part_boost <- boost_df %>%
+  mutate(participant = participant_name(user_id),
+    visual_confidence_boost = as_bool_vec(visual_confidence_boost)) %>%
+  group_by(participant) %>%
+  summarise(boost_cases = n(), boost_yes = sum(visual_confidence_boost, na.rm = TRUE), .groups = "drop") %>%
+  mutate(boost_rate_pct = pct(boost_yes, boost_cases))
+
+part_summary <- full_join(part_decision, part_boost, by = "participant") %>%
+  arrange(match(participant, part_order))
+
+part_summary_long <- bind_rows(part_summary %>%
+    transmute(participant,
+      metric = "Decision changed",
+      numerator = changed,
+      denominator = decision_cases,
+      percentage = change_rate_pct),
+  part_summary %>%
+    transmute(participant,
+      metric = "Confidence boosted",
+      numerator = boost_yes,
+      denominator = boost_cases,
+      percentage = boost_rate_pct)) %>%
+  # Reader 1 at top, readers descending
+  mutate(participant = factor(participant, levels = rev(part_order)))
+
+overall_decision_boost <- tibble( # Overall (pooled across all readers) rate per metric.
+  metric = c("Decision changed", "Confidence boosted"),
+  percentage = c(
+    pct(sum(decision_df$changed_decision), nrow(decision_df)),
+    pct(sum(as_bool_vec(boost_df$visual_confidence_boost), na.rm = TRUE), nrow(boost_df))
+  )
+)
+
+overall_pct <- function(m) overall_decision_boost$percentage[overall_decision_boost$metric == m]
+
+p_decision_metrics = part_summary_long %>%
+  ggplot(aes(participant, percentage, fill = metric)) +
+  geom_bar(position = "dodge", stat = "identity", alpha = 0.8) +
+  geom_hline(yintercept = overall_pct("Confidence boosted"), linetype = "dashed", 
+             colour = "#A78BFA", linewidth = 0.5) +
+  geom_hline(yintercept = overall_pct("Decision changed"), linetype = "dashed", 
+             colour = "#0E7490", linewidth = 0.5) +
+  theme_bw() + 
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 100)) +
+  labs(x = NULL, y = "Responses (%)") + coord_flip() + 
+  scale_fill_manual(values = c("#A78BFA", "#0E7490"))
+```
+
+```{r participant-row, fig.width=8.27, fig.height=4}
+p_participant_row <- ggarrange(
+  p_part_time, p_decision_metrics,
+  ncol = 2, nrow = 1,
+  widths = c(1, 1),
+  align = "h", legend = "bottom"
+)
+p_participant_row
+
+ggsave("./figures/reader-study/participant_row_A4.pdf", p_participant_row,
+  width = 8.27, height = 4, device = "pdf", bg = "white")
+```
+
+## Reasons for rejecting VReason.
+
+```{r}
+reason_tbl <- decision_df |>
+  filter(changed_decision) |>
+  mutate(reason_code = replace_na(revision_reason, "missing_reason")) |>
+  count(reason_code, name = "n") |>
+  right_join(tibble(reason_code = REASON_ORDER), by = "reason_code") |>
+  mutate(n = replace_na(n, 0L)) |>
+  filter(n > 0) |>
+  mutate(
+    primary_reason = recode(reason_code, !!!REASON_LABELS),
+    denominator = sum(n),
+    percentage = pct(n, denominator)
+  ) |>
+  add_wilson("n", "denominator") |>
+  select(primary_reason, n, denominator, percentage, ci_lo_pct, ci_hi_pct)
+
+p_decision_reason <- reason_tbl |>
+  mutate(primary_reason = fct_reorder(primary_reason, percentage)) |>
+  ggplot(aes(primary_reason, percentage, fill = primary_reason)) +
+  geom_col(width = 0.68, alpha = 0.9) +
+  geom_errorbar(aes(ymin = ci_lo_pct, ymax = ci_hi_pct), width = 0.2, linewidth = 0.45) +
+  geom_text(
+    aes(y = pmax(percentage, ci_hi_pct, na.rm = TRUE) + 4, label = fmt_count_pct(n, percentage)),
+    size = 3.0,
+    lineheight = 0.9
+  ) +
+  theme_bw() +
+  scale_fill_manual(values = REASON_COLOR) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 100)) +
+  labs(title = "Reason for change", x = NULL, y = "Changed responses (%)") +
+  guides(fill = "none") +
+  coord_flip()
+
+p_decision_reason
+```
+
+## Sankey: how decisions flow to confidence boosting (manual arm)
+
+```{r decision-confidence-sankey, fig.width=8.2, fig.height=4}
+# Per-response reasoning review (manual arm only): did the reader reject any of
+# VReason's region findings, or accept them all?
+review_per_case <- reviews %>%
+  filter(user_id %in% complete_user_ids) %>%
+  group_by(user_id, case_id) %>%
+  summarise(any_reject = any(is_accepted == FALSE), .groups = "drop")
+
+DECISION_LEVELS <- c("Adopted AI read", "Custom blend", "Kept own read")
+DECISION_COLOR <- c(
+  "Adopted AI read" = unname(MODEL_PALETTE[["VReason"]]),         # VReason red
+  "Custom blend"    = unname(MODEL_PALETTE[["Phi-3.5 Vision"]]),  # teal
+  "Kept own read"   = unname(MODEL_PALETTE[["LLaMA-3.2 11B"]])    # blue
+)
+# Reason axis: revision reason for changed cases; kept-own cases pass through "No change".
+REASON_LEVELS <- c("Visual reasoning\ntrace", "Conflicting AI\ninterpretation", "No change\n(kept own)")
+
+# Four temporal stages: review reasoning -> decision -> reason for change -> confidence.
+sankey_flow <- resp %>%
+  filter(presentation_mode == "manual", !is.na(final_interpretation_source)) %>%
+  mutate(visual_confidence_boost = as_bool_vec(visual_confidence_boost)) %>%
+  filter(!is.na(visual_confidence_boost)) %>%
+  left_join(review_per_case, by = c("user_id", "case_id")) %>%
+  transmute(
+    review = factor(
+      if_else(any_reject %in% TRUE, "Some findings\nrejected", "All AI findings\naccepted"),
+      levels = c("All AI findings\naccepted", "Some findings\nrejected")),
+    decision = recode(final_interpretation_source,
+      ai_interpretation      = "Adopted AI read",
+      custom_interpretation  = "Custom blend",
+      initial_interpretation = "Kept own read") %>% factor(levels = DECISION_LEVELS),
+    reason = case_when(
+      final_interpretation_source == "initial_interpretation" ~ "No change\n(kept own)",
+      revision_reason == "visual_reasoning_trace"             ~ "Visual reasoning\ntrace",
+      revision_reason == "conflicting_ai_interpretation"      ~ "Conflicting AI\ninterpretation",
+      TRUE                                                    ~ "No change\n(kept own)") %>%
+      factor(levels = REASON_LEVELS),
+    confidence = factor(
+      if_else(visual_confidence_boost, "Confidence\nboosted", "No boost"),
+      levels = c("Confidence\nboosted", "No boost"))
+  ) %>%
+  count(review, decision, reason, confidence, name = "n")
+
+n_manual <- sum(sankey_flow$n)
+
+p_decision_sankey <- ggplot(sankey_flow,
+    aes(axis1 = review, axis2 = decision, axis3 = reason, axis4 = confidence, y = n)) +
+  geom_alluvium(aes(fill = decision), width = 0.22, alpha = 0.72, curve_type = "sigmoid") +
+  geom_stratum(width = 0.22, fill = "grey97", colour = "grey45", linewidth = 0.35) +
+  geom_text(stat = "stratum",
+    aes(label = sprintf("%s\n(%d)", after_stat(stratum), after_stat(count))),
+    size = 2.4, lineheight = 0.8) +
+  scale_x_discrete(
+    limits = c("Reasoning review", "Final decision", "Reason for change", "Confidence"),
+    expand = expansion(mult = c(0.10, 0.10))) +
+  scale_fill_manual(values = DECISION_COLOR, name = "Final decision") +
+  labs(x = NULL, y = sprintf("Manual-arm responses (n=%d)", n_manual)) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom", panel.grid.major.x = element_blank(), panel.grid.minor = element_blank())
+
+p_decision_sankey
+
+# ggsave("./figures/reader-study/decision_confidence_sankey.pdf", 
+#        p_decision_sankey, width = 8.2, height = 4, device = "pdf")
+```
+
+```{r}
+tb = case_difficulty %>%
+  left_join(detailed_case %>% 
+              filter(!duplicated(case_id)) %>% 
+              select(case_id, gt_findings), 
+            by = "case_id")
+
+reasoning_counts <- resp %>%
+  left_join(reviews, by = c("case_id", "user_id")) %>%
+  filter(user_id %in% complete_user_ids) %>%
+  filter(presentation_mode == "manual") %>%
+  group_by(user_id, case_id) %>%
+  mutate(accepted_bin = ifelse(any(is_accepted == FALSE), "rejected", "accepted"),
+         n_rejected = sum(!is_accepted)) %>%
+  filter(!duplicated(case_id)) %>% ungroup() %>%
+  mutate(is_better = ifelse(visual_confidence_boost, "boosted", "not_boosted")) %>%
+  filter(is_better == "boosted")
+
+table(reasoning_counts$region_index, reasoning_counts$is_accepted)
+```
+
+```{r condition-combined, fig.width=4, fig.height=4}
+disease <- detailed_case |>
+  mutate(
+    across(c(gt_findings, human_caught, missed_by_human, recovered_by_AI),
+           ~ replace_na(as.integer(as.numeric(.x)), 0L)),
+    across(c(participant_name, case_difficulty, revision_reason, missed_conditions, recovered_conditions),
+           ~ replace_na(as.character(.x), "")),
+    human_missed_any = missed_by_human > 0,
+    ai_human_recovered_any = recovered_by_AI > 0,
+    recovered_due_to_visual_reasoning =
+      ai_human_recovered_any & revision_reason == "visual_reasoning_trace",
+    recovered_due_to_conflicting_ai =
+      ai_human_recovered_any & revision_reason == "conflicting_ai_interpretation"
+  )
+
+split_conditions <- function(x) {
+  str_split(replace_na(as.character(x), ""), ";") |>
+    unlist(use.names = FALSE) |>
+    str_trim() |>
+    purrr::discard(~ .x == "")
+}
+
+missed_condition_tbl <- tibble(condition = split_conditions(disease$missed_conditions)) |>
+  count(condition, name = "missed_by_human")
+recovered_condition_tbl <- tibble(condition = split_conditions(disease$recovered_conditions)) |>
+  count(condition, name = "recovered_by_AI")
+
+condition_tbl <- full_join(missed_condition_tbl, recovered_condition_tbl, by = "condition") |>
+  mutate(
+    across(c(missed_by_human, recovered_by_AI), ~ replace_na(.x, 0L)),
+    recovery_rate_pct = pct(recovered_by_AI, missed_by_human)
+  ) |>
+  arrange(desc(recovered_by_AI), desc(missed_by_human))
+
+disease_condition_tbl <- condition_tbl |>
+  filter(condition != "No Finding") |>
+  arrange(missed_by_human) |>
+  mutate(condition = factor(condition, levels = condition))
+
+# Combine missed vs recovered into a single dodged bar chart (both instance counts).
+condition_counts_long <- disease_condition_tbl |>
+  select(condition, missed_by_human, recovered_by_AI) |>
+  pivot_longer(c(missed_by_human, recovered_by_AI),
+               names_to = "metric", values_to = "instances") |>
+  mutate(metric = recode(metric,
+    missed_by_human = "Missed by human-only",
+    recovered_by_AI = "Recovered after AI + human"))
+
+# Distinct, colourblind-safe palette (Okabe-Ito orange/green; deliberately not blue/red).
+COND_METRIC_COLOR <- c(
+  "Missed by human-only"       = "#E69F00",
+  "Recovered after AI + human" = "#009E73"
+)
+
+p_condition_level <- ggplot(condition_counts_long,
+    aes(condition, instances, fill = metric)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.64, alpha = 0.9) +
+  scale_fill_manual(values = COND_METRIC_COLOR) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Disease findings: missed vs recovered", x = NULL, y = "Instances") +
+  theme_bw() +
+  theme(legend.position = "bottom", legend.title = element_blank()) +
+  coord_flip() 
+
+p_condition_level
+
+# ggsave("./figures/reader-study/condition_missed_recovered.pdf", p_condition_level,
+  # width = 4.13, height = 4, device = "pdf", bg = "white")
+```
+
+
+```{r}
+cl <- det %>%
+  group_by(case_id) %>%
+  summarise(case_difficulty = first(case_difficulty),
+            gt_conditions = first(gt_conditions),
+            ai_conditions = {v <- ai_conditions[!is.na(ai_conditions) & ai_conditions != ""]
+                                if (length(v)) v[[1]] else NA_character_},
+            across(all_of(ai_metrics),
+                   ~ if (all(is.na(.x))) NA_real_ else mean(.x, na.rm = TRUE)),
+            .groups = "drop") %>%
+  mutate(npath = npath(gt_conditions),
+         diff = factor(case_difficulty, levels = c("easy", "moderate", "difficult")),
+         has_ai = !is.na(ai_conditions))
+
+allc <- tibble(case_id = rep(cl$case_id, lengths(map(cl$gt_conditions, splitc))),
+               cond    = unlist(map(cl$gt_conditions, splitc))) %>%
+  filter(cond != "No Finding") %>% distinct(case_id, cond)
+freq <- allc %>% count(cond, name = "ncase") %>% mutate(surprisal = -log(ncase / Ncase))
+
+# # case-level novelty = surprisal of the rarest ground-truth condition
+# case_nov <- allc %>% left_join(freq, by = "cond") %>% group_by(case_id) %>%
+#   summarise(novelty = max(surprisal), .groups = "drop")
+# cl <- cl %>% left_join(case_nov, by = "case_id") %>% mutate(novelty = replace_na(novelty, 0))
+# 
+# per-condition VReason recall (caught among the cases VReason scored)
+rec <- allc %>%
+  left_join(cl |> select(case_id, ai_conditions, has_ai), by = "case_id") %>%
+  mutate(hit = purrr::map2_lgl(cond, ai_conditions, ~ .x %in% splitc(.y))) %>%
+  group_by(cond) %>%
+  summarise(ncase    = n(), n_scored = sum(has_ai), caught   = sum(hit[has_ai]),
+            recall   = ifelse(n_scored > 0, caught / n_scored, NA_real_), .groups  = "drop") %>%
+  left_join(freq |> select(cond, surprisal), by = "cond") %>%
+  mutate(lo = purrr::map2_dbl(caught, n_scored, ~ wilson(.x, .y)[1]),
+         hi = purrr::map2_dbl(caught, n_scored, ~ wilson(.x, .y)[2])) %>%
+  arrange(surprisal)
+
+
+man <- det |>
+  left_join(gtkey, by = "case_id") |>
+  mutate(gt_use = coalesce(gt_conditions_corrected, gt_conditions),
+         gt_p   = pset(gt_use),
+         hum_p  = pset(human_conditions),
+         hai_p  = pset(humanai_conditions),
+         npath           = lengths(gt_p),
+         missed_by_human = lengths(map2(gt_p, hum_p, setdiff)),
+         recovered_by_AI = lengths(map2(map2(gt_p, hum_p, setdiff), hai_p, intersect))) |>
+  filter(presentation_mode_raw == "manual", npath > 0, missed_by_human <= npath) |>
+  mutate(caught_h   = npath - missed_by_human,                       # unaided catches
+         caught_hai = pmin(npath, caught_h + recovered_by_AI),       # catches after VReason
+         h_recall   = caught_h / npath,
+         hai_recall = caught_hai / npath,
+         miss_rate  = missed_by_human / npath,
+         bin        = factor(pmin(npath, 3), levels = 1:3, labels = c("1", "2", "3+")))
+
+c1 <- man |> group_by(bin) |>
+  summarise(gt = sum(npath), H = sum(caught_h), HAI = sum(caught_hai), n_resp = n(), .groups = "drop") |>
+  pivot_longer(c(H, HAI), names_to = "arm", values_to = "caught") |>
+  mutate(recall = caught / gt,
+         lo = purrr::map2_dbl(caught, gt, ~ wilson(.x, .y)[1]),
+         hi = purrr::map2_dbl(caught, gt, ~ wilson(.x, .y)[2]),
+         arm = factor(arm, levels = c("H", "HAI"),
+                      labels = c("Unaided reader", "Reader + VReason")))
+ov_h   <- 100 * sum(man$caught_h)   / sum(man$npath)
+ov_hai <- 100 * sum(man$caught_hai) / sum(man$npath)
+
+p_c1 <- ggplot(c1, aes(bin, recall, fill = arm)) +
+  geom_col(position = position_dodge(0.7), width = 0.62, alpha = 0.9) +
+  scale_fill_manual(values = c("Unaided reader" = COL_NEU, "Reader + VReason" = COL_VR)) +
+  scale_y_continuous(labels = label_percent(), limits = c(0, 1)) +
+  labs(x = "Ground-truth findings per case  (npath)", y = "Findings retrieved")
+```
+
+
+
+
+
+

@@ -1,0 +1,593 @@
+---
+title: "figure-SLAKE-ablation-radar"
+author: "Harry Robertson"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 4.13,
+  fig.height = 5.12,
+  dpi = 600
+)
+
+library(tidyverse)
+library(patchwork)
+library(scales)
+
+RESULTS  <- "results"
+SUPP_DIR <- file.path("supp-figures", "ablation-figures")
+dir.create(SUPP_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# Bootstrap parameters used by boot_mean_ci() in figure2-helpers.R.
+N_BOOT <- 10000
+SEED   <- 42
+
+source("./figure2-helpers.R")
+
+MODEL_PALETTE <- c(
+  MODEL_PALETTE,
+  "Base"           = unname(MODEL_PALETTE[["Qwen2.5-VL 7B"]]),
+  "Base + CoT"     = unname(MODEL_PALETTE[["Qwen3-VL 8B"]]),
+  "Base + VReason" = unname(MODEL_PALETTE[["VReason"]])
+)
+
+ablation_label <- function(stem) {
+  case_when(
+    stem == "qwen2.5_vl_7b_instruct"     ~ "Base",
+    stem == "qwen2.5_vl_7b_instruct_cot" ~ "Base + CoT",
+    stem %in% c("vreason", "vreasson")   ~ "Base + VReason",
+    TRUE ~ model_label(stem)
+  )
+}
+
+load_ablation_per_sample <- function(directory) {
+  csvs <- list.files(directory, pattern = "\\.csv$", full.names = TRUE)
+  csvs <- csvs[!grepl("summary\\.csv$", csvs)]
+
+  frames <- map(csvs, function(p) {
+    stem <- tools::file_path_sans_ext(basename(p))
+    df <- read_csv(p, show_col_types = FALSE)
+    df$model       <- stem
+    df$model_label <- ablation_label(stem)
+    df
+  })
+  bind_rows(frames)
+}
+```
+
+```{r helpers}
+HALF_A4_WIDTH_IN  <- 105 / 25.4
+HALF_A4_HEIGHT_IN <- 130 / 25.4
+
+VQA_METRIC_LABELS <- c(
+  token_f1       = "Token F1",
+  exact_match    = "Exact match",
+  contains_match = "Contains match",
+  token_recall   = "Token recall"
+)
+
+MODALITY_LEVELS <- c("CT", "MRI", "X-Ray")
+ORGAN_LEVELS <- c(
+  "Abdomen", "Brain", "Brain_Face", "Brain_Tissue",
+  "Chest_mediastinal", "Lung", "Neck", "Pelvic Cavity"
+)
+CONTENT_TYPE_LEVELS <- c(
+  "Abnormality", "Color", "KG", "Modality", "Organ",
+  "Plane", "Position", "Quantity", "Shape", "Size"
+)
+
+pretty_stratum <- function(x) {
+  str_replace_all(x, "_", " ")
+}
+
+# Stratification specs used by make_combined_metric_summary. Keeping these
+# isolated lets us mix-and-match axes (modality + location, or
+# content_type + modality + location for subcategory radars) without
+# duplicating the bind_rows boilerplate.
+STRATIFICATION_SPECS <- list(
+  modality     = list(col = "modality",     levels = MODALITY_LEVELS,
+                      transform = identity),
+  location     = list(col = "location",     levels = pretty_stratum(ORGAN_LEVELS),
+                      transform = pretty_stratum),
+  content_type = list(col = "content_type", levels = CONTENT_TYPE_LEVELS,
+                      transform = identity)
+)
+
+safe_filename <- function(x) {
+  x |>
+    str_replace_all("[^A-Za-z0-9]+", "_") |>
+    str_replace_all("^_|_$", "") |>
+    str_to_lower()
+}
+
+metric_label <- function(metric) {
+  label <- VQA_METRIC_LABELS[[metric]]
+  if (is.null(label)) str_replace_all(metric, "_", " ") else label
+}
+
+metric_filename <- function(metric) {
+  metric |>
+    str_replace_all("_", "-") |>
+    str_replace_all("[^A-Za-z0-9-]+", "-") |>
+    str_replace_all("^-|-$", "") |>
+    str_to_lower()
+}
+
+make_combined_metric_summary <- function(ps_df, metric,
+                                          strata = c("modality", "location"),
+                                          comparison_labels = NULL) {
+  specs <- STRATIFICATION_SPECS[strata]
+  comparison_levels <- unlist(map(specs, "levels"), use.names = FALSE)
+
+  if (is.null(comparison_labels)) {
+    comparison_labels <- comparison_levels
+  }
+  label_lookup <- set_names(comparison_labels, comparison_levels)
+
+  comparison_df <- map_dfr(specs, function(s) {
+    tibble(
+      model_label = ps_df$model_label,
+      comparison  = s$transform(ps_df[[s$col]]),
+      value       = ps_df[[metric]]
+    )
+  })
+
+  summary_df <- comparison_df |>
+    mutate(comparison = factor(comparison, levels = comparison_levels)) |>
+    filter(!is.na(comparison)) |>
+    group_by(model_label, comparison) |>
+    summarise(value = mean(value, na.rm = TRUE), .groups = "drop") |>
+    mutate(
+      model_label = factor(
+        model_label,
+        levels = c("Base", "Base + CoT", "Base + VReason")
+      ),
+      comparison = as.character(comparison),
+      comparison_label = unname(label_lookup[comparison])
+    ) |>
+    arrange(model_label) |>
+    select(-comparison) |>
+    pivot_wider(names_from = comparison_label, values_from = value) |>
+    mutate(model_label = as.character(model_label))
+
+  # Drop comparison labels with no data after filtering (e.g. Shape/Quantity
+  # have zero CLOSED questions) so the radar doesn't try to render NA axes.
+  present_labels <- comparison_labels[comparison_labels %in% names(summary_df)]
+
+  list(summary = summary_df, levels = present_labels)
+}
+
+# Per-spoke axis ranges for the SLAKE radars, matching the RG radars
+# (MIMIC/IU), where each spoke is scaled to its own [min, max] instead of a
+# shared 0-1 scale. The RG radars use a hand-tuned limits list; the SLAKE
+# axes are dynamic categories (modality / organ / content-type), so we derive
+# the limits from the data. For each axis we take the min/max across the three
+# ablation variants, pad outward, then round to clean 0.05 bounds. Rounding
+# outward guarantees every observed value sits strictly inside its range, so
+# radar_plot()'s out-of-range guard never trips.
+compute_radar_axis_limits <- function(summary_df, labels,
+                                      pad_frac = 0.1, min_pad = 0.02,
+                                      accuracy = 0.05) {
+  set_names(
+    lapply(labels, function(lbl) {
+      vals <- summary_df[[lbl]]
+      vals <- vals[is.finite(vals)]
+      if (length(vals) == 0) return(c(0, 1))
+
+      lo <- min(vals)
+      hi <- max(vals)
+      pad <- max(min_pad, pad_frac * (hi - lo))
+
+      lo_p <- max(0, floor((lo - pad) / accuracy) * accuracy)
+      hi_p <- min(1, ceiling((hi + pad) / accuracy) * accuracy)
+
+      if (hi_p <= lo_p) {
+        lo_p <- max(0, lo_p - accuracy)
+        hi_p <- min(1, max(hi_p + accuracy, lo_p + accuracy))
+      }
+      c(lo_p, hi_p)
+    }),
+    labels
+  )
+}
+
+make_ablation_metric_plot <- function(ps_df, metric, title,
+                                      strata = c("modality", "location"),
+                                      comparison_labels = NULL,
+                                      label_size = 3.2, grid_label_size = 2.8,
+                                      line_width = 1.1, point_size = 1.8,
+                                      coord_xlim = c(-1.36, 1.36),
+                                      coord_ylim = c(-1.16, 1.16),
+                                      plot_margin = margin(4, 8, 4, 8),
+                                      scale_axes = TRUE) {
+  combined_metric <- make_combined_metric_summary(ps_df, metric, strata,
+                                                  comparison_labels)
+
+  axis_limits <- if (scale_axes) {
+    compute_radar_axis_limits(combined_metric$summary, combined_metric$levels)
+  } else {
+    NULL
+  }
+
+  radar_plot(
+    combined_metric$summary,
+    combined_metric$levels,
+    title = title,
+    axis_limits = axis_limits,
+    label_size = label_size,
+    grid_label_size = grid_label_size,
+    fill_alpha = 0.2,
+    line_width = line_width,
+    point_size = point_size
+  ) +
+    coord_equal(xlim = coord_xlim, ylim = coord_ylim, expand = FALSE, clip = "off") +
+    guides(colour = guide_legend(nrow = 1, byrow = TRUE)) +
+    theme(
+      plot.title = element_text(size = 9, face = "bold", hjust = 0.5),
+      legend.text = element_text(size = 6),
+      legend.key.width = unit(0.32, "cm"),
+      legend.key.height = unit(0.24, "cm"),
+      legend.spacing.x = unit(0.08, "cm"),
+      legend.margin = margin(0, 0, 0, 0),
+      plot.margin = plot_margin
+    )
+}
+
+make_ablation_token_f1_plot <- function(ps_df, title) {
+  make_ablation_metric_plot(ps_df, "token_f1", title)
+}
+
+# Larger square canvas for the subcategory radar (content_type + modality +
+# location = up to 21 axes), where the half-A4 portrait size is too cramped.
+SUBCATEGORY_WIDTH_IN  <- 7
+SUBCATEGORY_HEIGHT_IN <- 7
+
+save_half_a4_pdf <- function(plot, filename) {
+  ggsave(
+    filename = file.path(SUPP_DIR, paste0(filename, ".pdf")),
+    plot = plot,
+    width = HALF_A4_WIDTH_IN,
+    height = HALF_A4_HEIGHT_IN,
+    device = "pdf",
+    bg = "white"
+  )
+}
+
+save_square_pdf <- function(plot, filename,
+                            width = SUBCATEGORY_WIDTH_IN,
+                            height = SUBCATEGORY_HEIGHT_IN) {
+  ggsave(
+    filename = file.path(SUPP_DIR, paste0(filename, ".pdf")),
+    plot = plot,
+    width = width,
+    height = height,
+    device = "pdf",
+    bg = "white"
+  )
+}
+
+```
+
+```{r data}
+abl_vqa_slake_ps <- load_ablation_per_sample(file.path(RESULTS, "ablation/vqa/slake"))
+colnames(abl_vqa_slake_ps)
+abl_slake_summary <- build_summary(abl_vqa_slake_ps, VQA_METRIC_LABELS)
+p_abl_mimic <- radar_plot(abl_slake_summary, VQA_METRIC_LABELS, title = "SLAKE (VQA ablation)")
+```
+
+# SLAKE Ablation Metric Radars
+
+These plots compare Base, Base + CoT, and Base + VReason on SLAKE VQA metrics
+across all modality and organ/body-region comparisons.
+
+```{r slake-ablation-metric-radars, fig.width=4.13, fig.height=5.12}
+ablation_metrics <- c("token_f1", "exact_match", "contains_match", "token_recall")
+
+slake_ablation_metric_plots <- ablation_metrics |>
+  set_names() |>
+  map(\(metric) {
+    p <- make_ablation_metric_plot(
+      abl_vqa_slake_ps,
+      metric,
+      paste0("SLAKE ablation ", metric_label(metric), " - all questions")
+    )
+
+    save_half_a4_pdf(
+      p,
+      paste0(
+        "figure-SLAKE-ablation-",
+        metric_filename(metric),
+        "-all-comparisons"
+      )
+    )
+
+    p
+  })
+
+slake_ablation_token_f1_all <- slake_ablation_metric_plots[["token_f1"]]
+
+walk(slake_ablation_metric_plots, print)
+```
+
+# SLAKE Ablation Token F1 / Token Recall Radars by Answer Type
+
+These use the same axes and styling, split by `answer_type`.
+
+```{r slake-ablation-token-metrics-by-answer}
+answer_type_metric_plots <- crossing(
+  metric = c("token_f1", "token_recall"),
+  answer_type_level = c("OPEN", "CLOSED")
+) |>
+  pmap(function(metric, answer_type_level) {
+    sub_ps <- abl_vqa_slake_ps |> filter(answer_type == answer_type_level)
+
+    p <- make_ablation_metric_plot(
+      sub_ps,
+      metric,
+      paste0("SLAKE ablation ", metric_label(metric),
+             " - ", answer_type_level, " questions")
+    )
+
+    save_half_a4_pdf(
+      p,
+      paste0(
+        "figure-SLAKE-ablation-", metric_filename(metric),
+        "-all-comparisons-", safe_filename(answer_type_level)
+      )
+    )
+
+    p
+  })
+
+walk(answer_type_metric_plots, print)
+```
+
+# SLAKE Ablation Subcategory Radars (content_type + modality + location)
+
+One radar per (metric × answer-type slice) combining all three SLAKE
+stratifications onto a single axis. Axes whose categories have no questions
+in a given slice (e.g. `Shape`, `Quantity` for `CLOSED`) are dropped
+automatically.
+
+```{r slake-ablation-subcategory-radars, fig.width=7, fig.height=7}
+subcategory_strata <- c("content_type", "modality", "location")
+
+answer_type_slices <- list(
+  all    = list(label = "all questions",    filter = function(df) df),
+  open   = list(label = "OPEN questions",   filter = function(df) filter(df, answer_type == "OPEN")),
+  closed = list(label = "CLOSED questions", filter = function(df) filter(df, answer_type == "CLOSED"))
+)
+
+subcategory_plots <- crossing(
+  metric = ablation_metrics,
+  slice  = names(answer_type_slices)
+) |>
+  pmap(function(metric, slice) {
+    slice_spec <- answer_type_slices[[slice]]
+    sub_ps     <- slice_spec$filter(abl_vqa_slake_ps)
+
+    p <- make_ablation_metric_plot(
+      sub_ps,
+      metric,
+      paste0("SLAKE subcategory ", metric_label(metric),
+             " - ", slice_spec$label),
+      strata          = subcategory_strata,
+      label_size      = 2.6,
+      grid_label_size = 2.4,
+      line_width      = 0.9,
+      point_size      = 1.4,
+      coord_xlim      = c(-1.55, 1.55),
+      coord_ylim      = c(-1.4, 1.4),
+      plot_margin     = margin(6, 18, 6, 18)
+    )
+
+    save_square_pdf(
+      p,
+      paste0(
+        "figure-SLAKE-ablation-subcategory-",
+        metric_filename(metric), "-", safe_filename(slice)
+      )
+    )
+
+    p
+  })
+
+walk(subcategory_plots, print)
+```
+
+# SLAKE Ablation Content-Type + Region Radars per Modality
+
+One radar per imaging modality (CT, MRI, X-Ray). Each radar subsets to all
+SLAKE images of that modality and uses both the `content_type` categories and
+the organ/body-region (`location`) strata as axes, comparing Base / Base + CoT
+/ Base + VReason on `token_recall`. This drills the combined modality+organ
+radar down so that each modality gets its own radar over the remaining findings
+(content types and regions). Axes with no questions in a given modality (e.g.
+`Shape` outside CT, or regions that only appear under one modality) are dropped
+automatically.
+
+```{r slake-ablation-modality-content-type-region-radars, fig.width=13.5, fig.height=5.5}
+modality_radar_metric <- "token_recall"
+
+make_modality_findings_radar <- function(ps_df, modality_level, metric,
+                                          title = NULL) {
+  sub_ps <- ps_df |> filter(modality == modality_level)
+  if (is.null(title)) {
+    n_examples <- n_distinct(sub_ps$id)
+    title <- paste0(modality_level, " (", metric_label(metric),
+                    ", n = ", n_examples, ")")
+  }
+
+  make_ablation_metric_plot(
+    sub_ps, metric, title,
+    strata          = c("content_type", "location"),
+    label_size      = 2.6,
+    grid_label_size = 2.4,
+    line_width      = 0.9,
+    point_size      = 1.4,
+    coord_xlim      = c(-1.55, 1.55),
+    coord_ylim      = c(-1.4, 1.4),
+    plot_margin     = margin(6, 18, 6, 18)
+  )
+}
+
+modality_findings_radars <- MODALITY_LEVELS |>
+  set_names() |>
+  map(\(mod) {
+    p <- make_modality_findings_radar(abl_vqa_slake_ps, mod,
+                                      modality_radar_metric)
+    save_square_pdf(
+      p,
+      paste0("figure-SLAKE-ablation-content-type-region-",
+             metric_filename(modality_radar_metric),
+             "-modality-", safe_filename(mod)),
+      width = 4.5, height = 5
+    )
+    p
+  })
+
+modality_findings_panel <- wrap_plots(modality_findings_radars, ncol = 3,
+                                      guides = "collect") +
+  plot_annotation(
+    title = paste0("SLAKE ablation by content type + region, per modality - ",
+                   metric_label(modality_radar_metric)),
+    theme = theme(plot.title = element_text(size = 11, face = "bold",
+                                            hjust = 0.5))
+  ) &
+  theme(legend.position = "bottom")
+
+save_square_pdf(
+  modality_findings_panel,
+  paste0("figure-SLAKE-ablation-content-type-region-",
+         metric_filename(modality_radar_metric), "-by-modality-panel"),
+  width = 13.5, height = 5.5
+)
+
+modality_findings_panel
+```
+
+# SLAKE Ablation Bar Plots with Bootstrap CIs (split by stratum)
+
+One bar plot per (metric × stratification × answer-type slice) comparing
+Base / Base + CoT / Base + VReason. y-axis is the metric, x-axis is the
+stratum level (e.g. CT / MRI / X-Ray for modality), bars are dodged by
+ablation variant with 95% bootstrap CI error bars (B = 10,000).
+
+```{r slake-ablation-bar-helpers}
+compute_strata_boot_cis <- function(ps_df, metrics, stratum_col,
+                                    stratum_levels = NULL,
+                                    pretty = FALSE) {
+  if (is.null(stratum_levels)) {
+    stratum_levels <- sort(unique(ps_df[[stratum_col]]))
+  }
+  display_levels <- if (pretty) pretty_stratum(stratum_levels) else stratum_levels
+
+  ps_df |>
+    select(model_label, all_of(stratum_col), all_of(metrics)) |>
+    rename(stratum = !!stratum_col) |>
+    mutate(stratum = factor(stratum, levels = stratum_levels)) |>
+    filter(!is.na(stratum)) |>
+    pivot_longer(all_of(metrics), names_to = "metric", values_to = "value") |>
+    group_by(model_label, stratum, metric) |>
+    summarise(boot_mean_ci(value), .groups = "drop") |>
+    mutate(
+      stratum = factor(
+        if (pretty) pretty_stratum(as.character(stratum)) else as.character(stratum),
+        levels = display_levels
+      ),
+      model_label = factor(
+        model_label,
+        levels = c("Base", "Base + CoT", "Base + VReason")
+      )
+    )
+}
+
+bar_with_ci_by_stratum <- function(boot_df, metric_name, title,
+                                   y_label = NULL,
+                                   y_limits = c(0, 1)) {
+  plot_df <- boot_df |> filter(metric == metric_name)
+  if (nrow(plot_df) == 0) return(ggplot() + theme_void())
+
+  models <- levels(plot_df$model_label)
+  cols   <- get_model_colours(models)
+  if (is.null(y_label)) y_label <- metric_label(metric_name)
+
+  ggplot(plot_df,
+         aes(x = stratum, y = mean, fill = model_label, group = model_label)) +
+    geom_col(position = position_dodge(width = 0.8), width = 0.72,
+             alpha = 0.85, colour = NA) +
+    geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi),
+                  position = position_dodge(width = 0.8),
+                  width = 0.28, linewidth = 0.35) +
+    scale_fill_manual(values = cols, limits = models) +
+    scale_y_continuous(limits = y_limits,
+                       breaks = seq(y_limits[1], y_limits[2], 0.2),
+                       expand = expansion(mult = c(0, 0.02))) +
+    labs(title = title, x = NULL, y = y_label, fill = NULL) +
+    theme_bw(base_size = 10) +
+    theme(
+      panel.grid.major.x = element_blank(),
+      axis.text.x  = element_text(angle = 30, hjust = 1, size = 8),
+      legend.position = "bottom",
+      legend.text  = element_text(size = 8),
+      plot.title   = element_text(face = "bold", size = 11, hjust = 0.5)
+    ) +
+    guides(fill = guide_legend(nrow = 1, byrow = TRUE))
+}
+
+STRATA_BAR_SPECS <- list(
+  modality     = list(col = "modality",     levels = MODALITY_LEVELS,
+                       pretty = FALSE, label = "modality"),
+  content_type = list(col = "content_type", levels = CONTENT_TYPE_LEVELS,
+                       pretty = FALSE, label = "content type"),
+  location     = list(col = "location",     levels = ORGAN_LEVELS,
+                       pretty = TRUE,  label = "organ")
+)
+```
+
+```{r slake-ablation-bar-plots, fig.width=8.5, fig.height=5}
+ablation_strata_bar_plots <- crossing(
+  stratum = names(STRATA_BAR_SPECS),
+  metric  = ablation_metrics,
+  slice   = names(answer_type_slices)
+) |>
+  pmap(function(stratum, metric, slice) {
+    spec       <- STRATA_BAR_SPECS[[stratum]]
+    slice_spec <- answer_type_slices[[slice]]
+    sub_ps     <- slice_spec$filter(abl_vqa_slake_ps)
+
+    boot_df <- compute_strata_boot_cis(
+      sub_ps, ablation_metrics, spec$col, spec$levels, pretty = spec$pretty
+    )
+
+    p <- bar_with_ci_by_stratum(
+      boot_df, metric,
+      title = paste0("SLAKE ablation ", metric_label(metric),
+                     " by ", spec$label, " - ", slice_spec$label)
+    )
+
+    panel_w <- if (stratum == "modality") 6 else 8.5
+    ggsave(
+      filename = file.path(
+        SUPP_DIR,
+        paste0("figure-SLAKE-ablation-bars-by-", safe_filename(stratum),
+               "-", metric_filename(metric), "-", safe_filename(slice), ".pdf")
+      ),
+      plot = p, width = panel_w, height = 4.5, device = "pdf", bg = "white"
+    )
+
+    p
+  })
+
+walk(ablation_strata_bar_plots, print)
+```

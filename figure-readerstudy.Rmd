@@ -1,0 +1,1319 @@
+---
+title: "figure-readerstudy"
+author: "Harry Robertson"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+params:
+  reader_root: "../reader_study"
+  response_version: "latest"
+  remove_time_outliers: true
+  outlier_iqr_multiplier: 1.5
+  seed: 42
+  bootstrap_n: 5000
+---
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 14,
+  fig.height = 8,
+  dpi = 600
+)
+```
+
+```{r library-helpers}
+library(tidyverse)
+library(patchwork)
+library(ggpubr)
+library(scales)
+library(broom)
+
+set.seed(params$seed)
+
+READER_ROOT <- normalizePath(params$reader_root, mustWork = TRUE)
+RESPONSES_ROOT <- file.path(READER_ROOT, "responses")
+
+FIG_DIR <- "main-figures"
+SUPP_DIR <- file.path("supp-figures", "reader-study-figures")
+
+walk(c(
+    FIG_DIR,
+    SUPP_DIR,
+    file.path(SUPP_DIR, "overall"),
+    file.path(SUPP_DIR, "confidence"),
+    file.path(SUPP_DIR, "disease_recovery")
+  ),
+  ~ dir.create(.x, showWarnings = FALSE, recursive = TRUE)
+)
+
+source("./figure2-helpers.R")
+```
+
+```{r statistical-helpers}
+as_bool_vec <- function(x) {
+  if (is.logical(x)) return(x)
+  if (is.numeric(x)) {
+    return(case_when(is.na(x) ~ NA, x == 0 ~ FALSE, TRUE ~ TRUE))
+  }
+
+  txt <- str_to_lower(str_trim(as.character(x)))
+  case_when(
+    txt %in% c("true", "t", "yes", "y", "1") ~ TRUE,
+    txt %in% c("false", "f", "no", "n", "0") ~ FALSE,
+    TRUE ~ NA
+  )
+}
+
+pct <- function(n, d) {
+  d <- rep(d, length.out = length(n))
+  out <- 100 * n / d
+  out[is.na(d) | d == 0] <- NA_real_
+  out
+}
+
+wilson_ci <- function(k, n, z = 1.959963984540054) {
+  if (is.na(n) || n == 0) return(c(NA_real_, NA_real_))
+  phat <- k / n
+  denom <- 1 + z^2 / n
+  center <- (phat + z^2 / (2 * n)) / denom
+  half <- z * sqrt((phat * (1 - phat) / n) + (z^2 / (4 * n^2))) / denom
+  c(center - half, center + half)
+}
+
+add_wilson <- function(df, numerator_col, denominator_col, prefix = "ci") {
+  cis <- map2(df[[numerator_col]], df[[denominator_col]], wilson_ci)
+  df[[paste0(prefix, "_lo_pct")]] <- map_dbl(cis, 1) * 100
+  df[[paste0(prefix, "_hi_pct")]] <- map_dbl(cis, 2) * 100
+  df
+}
+
+bootstrap_diff_samples <- function(x, y, fun = mean, n_boot = params$bootstrap_n) {
+  x <- as.numeric(x[!is.na(x)])
+  y <- as.numeric(y[!is.na(y)])
+  if (length(x) == 0 || length(y) == 0) return(numeric())
+
+  replicate(
+    n_boot,
+    fun(sample(x, length(x), replace = TRUE)) -
+      fun(sample(y, length(y), replace = TRUE))
+  )
+}
+
+bootstrap_diff_ci <- function(x, y, fun = mean, n_boot = params$bootstrap_n) {
+  samples <- bootstrap_diff_samples(x, y, fun, n_boot)
+  if (length(samples) == 0) {
+    return(tibble(diff = NA_real_, ci_lo = NA_real_, ci_hi = NA_real_))
+  }
+
+  tibble(
+    diff = fun(x, na.rm = TRUE) - fun(y, na.rm = TRUE),
+    ci_lo = unname(quantile(samples, 0.025, na.rm = TRUE)),
+    ci_hi = unname(quantile(samples, 0.975, na.rm = TRUE))
+  )
+}
+
+cohens_d <- function(x, y) {
+  x <- as.numeric(x[!is.na(x)])
+  y <- as.numeric(y[!is.na(y)])
+  if (length(x) < 2 || length(y) < 2) return(NA_real_)
+
+  pooled <- sqrt(((length(x) - 1) * var(x) + (length(y) - 1) * var(y)) /
+                   (length(x) + length(y) - 2))
+  ifelse(pooled == 0, NA_real_, (mean(x) - mean(y)) / pooled)
+}
+
+rank_biserial <- function(x, y) {
+  x <- as.numeric(x[!is.na(x)])
+  y <- as.numeric(y[!is.na(y)])
+  if (length(x) == 0 || length(y) == 0) return(NA_real_)
+
+  w <- wilcox.test(x, y, exact = FALSE)$statistic
+  u <- as.numeric(w) - length(x) * (length(x) + 1) / 2
+  (2 * u) / (length(x) * length(y)) - 1
+}
+```
+
+```{r output-and-style-helpers}
+fmt_count_pct <- function(n, pct_value) {
+  sprintf("%.1f%%\n(n=%s)", pct_value, comma(n))
+}
+
+reader_theme <- function(base_size = 10) {
+  theme_bw(base_size = base_size) +
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.y = element_line(colour = "#D9D9D9", linewidth = 0.35),
+      panel.border = element_rect(colour = "#111111", fill = NA, linewidth = 0.45),
+      axis.title = element_text(colour = "#111111"),
+      axis.text = element_text(colour = "#111111"),
+      plot.title = element_text(face = "bold", size = rel(1.03), margin = margin(b = 5)),
+      plot.subtitle = element_text(colour = "grey35", size = rel(0.9)),
+      legend.title = element_blank(),
+      legend.position = "bottom",
+      strip.background = element_rect(fill = "grey95", colour = "#111111", linewidth = 0.35),
+      strip.text = element_text(face = "bold")
+    )
+}
+
+theme_set(reader_theme())
+
+col_visual <- unname(MODEL_PALETTE[["VReason"]])
+col_manual <- unname(MODEL_PALETTE[["LLaMA-3.2 11B"]])
+col_secondary <- unname(MODEL_PALETTE[["Qwen2.5-VL 7B"]])
+col_teal <- unname(MODEL_PALETTE[["Phi-3.5 Vision"]])
+col_gold <- unname(MODEL_PALETTE[["InternVL3.5 8B"]])
+col_orange <- unname(MODEL_PALETTE[["Qwen3-VL 8B"]])
+col_neutral <- "#9CA3AF"
+
+MODE_LABEL <- c(manual = "Manual", ai_assisted = "AI-assisted")
+MODE_COLOR <- c(manual = col_manual, ai_assisted = col_visual)
+STATUS_COLOR <- c(
+  "Changed" = col_visual,
+  "No change" = col_neutral,
+  "Accepted" = col_visual,
+  "Rejected" = col_neutral,
+  "Yes" = col_visual,
+  "No" = col_neutral
+)
+REASON_LABELS <- c(
+  visual_reasoning_trace = "Visual reasoning trace",
+  conflicting_ai_interpretation = "Conflicting AI interpretation",
+  missing_reason = "Missing response"
+)
+REASON_ORDER <- names(REASON_LABELS)
+REASON_COLOR <- c(
+  "Visual reasoning trace" = col_visual,
+  "Conflicting AI interpretation" = col_manual,
+  "Missing response" = col_neutral
+)
+CONTEXT_LABEL <- c(
+  initial_interpretation = "Confidence challenging\nAI decision",
+  custom_interpretation = "Confidence accepting or\nrevising draft",
+  ai_interpretation = "Confidence accepting\nAI report"
+)
+CONTEXT_COLOR <- c(
+  initial_interpretation = col_manual,
+  custom_interpretation = col_teal,
+  ai_interpretation = col_visual
+)
+DIFF_ORDER <- c("easy", "moderate", "difficult")
+DIFF_COLOR <- c(easy = col_teal, moderate = col_gold, difficult = col_orange)
+RECOVERY_COLOR <- c(
+  human_caught = col_teal,
+  human_missed = col_manual,
+  recovered = col_visual,
+  remaining = col_neutral,
+  visual_reasoning = col_visual,
+  conflicting_ai = col_manual,
+  other = col_secondary
+)
+```
+
+```{r load-reader-data}
+version_order <- function(paths) {
+  version_num <- str_match(basename(paths), "^version_(\\d+)$")[, 2]
+  ifelse(is.na(version_num), 0L, as.integer(version_num))
+}
+
+version_dirs <- list.dirs(RESPONSES_ROOT, recursive = FALSE, full.names = TRUE)
+version_dirs <- version_dirs[str_detect(basename(version_dirs), "^version_")]
+if (length(version_dirs) == 0) {
+  stop("No version_* folders found under ", RESPONSES_ROOT, call. = FALSE)
+}
+version_dirs <- version_dirs[order(version_order(version_dirs))]
+
+response_version_dir <- if (identical(params$response_version, "latest")) {
+  tail(version_dirs, 1)
+} else {
+  selected <- file.path(RESPONSES_ROOT, params$response_version)
+  if (!dir.exists(selected)) {
+    stop("Requested response_version not found: ", params$response_version, call. = FALSE)
+  }
+  selected
+}
+response_version <- basename(response_version_dir)
+
+responses <- read_csv(file.path("~/Downloads/case_responses_rows.csv"), show_col_types = FALSE)
+assignments <- read_csv(file.path("~/Downloads/user_case_assignments_rows.csv"), show_col_types = FALSE)
+profiles <- read_csv(file.path("~/Downloads/profiles_rows.csv"), show_col_types = FALSE) |>
+  mutate(is_study_complete = as_bool_vec(is_study_complete))
+reviews <- read_csv(file.path("~/Downloads/finding_reviews_rows.csv"), show_col_types = FALSE)
+cases <- read_csv(file.path("~/Downloads/cases_rows.csv"), show_col_types = FALSE)
+
+complete_user_ids <- profiles |>
+  filter(is_study_complete %in% TRUE) |>
+  pull(id)
+
+responses <- responses |>
+  filter(user_id %in% complete_user_ids) |>
+  mutate(
+    interpret_time_seconds = as.numeric(interpret_time_seconds),
+    visual_confidence_boost = as_bool_vec(visual_confidence_boost)
+  )
+
+reviews <- reviews |>
+  filter(user_id %in% complete_user_ids) |>
+  mutate(is_accepted = as_bool_vec(is_accepted))
+
+resp <- responses |>
+  left_join(
+    assignments |> select(assignment_id = id, presentation_mode, presentation_order),
+    by = "assignment_id"
+  ) |>
+  mutate(
+    changed_decision = final_interpretation_source %in% c("ai_interpretation", "custom_interpretation"),
+    is_ai_assisted = presentation_mode == "ai_assisted",
+    time_minutes = interpret_time_seconds / 60
+  )
+
+time_df_raw <- resp |>
+  filter(
+    !is.na(presentation_mode),
+    presentation_mode %in% c("manual", "ai_assisted"),
+    !is.na(interpret_time_seconds)
+  )
+
+time_flagged <- time_df_raw |>
+  group_by(presentation_mode) |>
+  mutate(
+    q1 = quantile(interpret_time_seconds, 0.25, na.rm = TRUE),
+    q3 = quantile(interpret_time_seconds, 0.75, na.rm = TRUE),
+    iqr = q3 - q1,
+    keep_time = between(
+      interpret_time_seconds,
+      q1 - params$outlier_iqr_multiplier * iqr,
+      q3 + params$outlier_iqr_multiplier * iqr
+    )
+  ) |>
+  ungroup()
+time_df <- time_flagged |> filter(keep_time) |> select(-q1, -q3, -iqr, -keep_time)
+removed_outliers <- sum(!time_flagged$keep_time)
+
+decision_df <- resp |> filter(!is.na(final_interpretation_source))
+review_df <- reviews |> filter(!is.na(is_accepted))
+boost_df <- resp |> filter(!is.na(visual_confidence_boost))
+case_difficulty <- cases |> select(case_id = id, case_difficulty)
+```
+
+```{r}
+table(review_df$is_accepted)
+```
+
+
+```{r}
+manual_counts <- resp %>%
+  filter(presentation_mode == "manual") %>%
+  mutate(is_better = ifelse(visual_confidence_boost, "boosted", "not_boosted")) %>%
+  filter(!is.na(final_interpretation_source), !is.na(is_better)) %>%
+  count(final_interpretation_source, is_better)
+
+ggplot(manual_counts, aes(x = final_interpretation_source, y = n, fill = is_better)) +
+  geom_bar(stat = "identity", position = "dodge") + labs(x = NULL, y = "Responses (count)") + 
+  theme_bw() +scale_fill_manual(values = c(boosted = col_visual, 
+                                           not_boosted = col_manual), name = "Confidence boost") +
+  theme(axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12))
+```
+
+
+```{r}
+# Do readers who accept the visual reasoning trace, improve the confidence of their interpretation?
+reasoning_counts <- resp %>%
+  left_join(reviews, by = c("case_id", "user_id")) %>%
+  filter(user_id %in% complete_user_ids) %>%
+  filter(presentation_mode == "manual") %>%
+  group_by(user_id, case_id) %>%
+  mutate(accepted_bin = ifelse(any(is_accepted == FALSE), "rejected", "accepted"),
+         n_rejected = sum(!is_accepted)) %>%
+  filter(!duplicated(case_id)) %>% ungroup() %>%
+  mutate(is_better = ifelse(visual_confidence_boost, "boosted", "not_boosted")) 
+
+reasoning_counts %>%
+  count(accepted_bin, is_better, user_id) %>% 
+  ggplot(aes(x = accepted_bin, y = n, fill = is_better)) +
+  geom_bar(stat = "identity", position = "dodge") + labs(x = NULL, y = "Responses (count)") + 
+  theme_bw() + scale_fill_manual(values = c(boosted = col_visual, 
+                                           not_boosted = col_manual), name = "Confidence boost") +
+  theme(axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12))
+
+reasoning_counts %>%
+  count(is_accepted, is_better, case_id) %>%
+  arrange(desc(n))
+
+chisq_accept_trace = chisq.test(table(reasoning_counts$is_accepted, reasoning_counts$is_better))
+# (chisq_accept_trace$expected - chisq_accept_trace$observed) / chisq_accept_trace$expected^2
+```
+
+
+# Reader Study Figures
+
+```{r figure-overall-decision-change, fig.width=4.8, fig.height=4}
+n_total_decision <- nrow(decision_df)
+n_changed <- sum(decision_df$changed_decision, na.rm = TRUE)
+
+decision_rate_tbl <- tibble(
+  status = c("Changed", "No change"),
+  n = c(n_changed, n_total_decision - n_changed),
+  denominator = n_total_decision
+) |>
+  mutate(percentage = pct(n, denominator)) |>
+  add_wilson("n", "denominator")
+
+p_decision_rate <- ggplot(decision_rate_tbl, aes(status, percentage, fill = status)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = ci_lo_pct, ymax = ci_hi_pct), width = 0.2, linewidth = 0.45) +
+  geom_text(
+    aes(y = pmax(percentage, ci_hi_pct, na.rm = TRUE) + 4, label = fmt_count_pct(n, percentage)),
+    size = 3.0,
+    lineheight = 0.9
+  ) +
+  scale_fill_manual(values = STATUS_COLOR) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 100)) +
+  labs(x = NULL, y = "Responses (%)") +
+  guides(fill = "none")
+
+p_decision_rate
+```
+
+```{r figure-decision-change-reason, fig.width=5.8, fig.height=4}
+reason_tbl <- decision_df |>
+  filter(changed_decision) |>
+  mutate(reason_code = replace_na(revision_reason, "missing_reason")) |>
+  count(reason_code, name = "n") |>
+  right_join(tibble(reason_code = REASON_ORDER), by = "reason_code") |>
+  mutate(n = replace_na(n, 0L)) |>
+  filter(n > 0) |>
+  mutate(
+    primary_reason = recode(reason_code, !!!REASON_LABELS),
+    denominator = sum(n),
+    percentage = pct(n, denominator)
+  ) |>
+  add_wilson("n", "denominator") |>
+  select(primary_reason, n, denominator, percentage, ci_lo_pct, ci_hi_pct)
+
+p_decision_reason <- reason_tbl |>
+  mutate(primary_reason = fct_reorder(primary_reason, percentage)) |>
+  ggplot(aes(primary_reason, percentage, fill = primary_reason)) +
+  geom_col(width = 0.68, alpha = 0.9) +
+  geom_errorbar(aes(ymin = ci_lo_pct, ymax = ci_hi_pct), width = 0.2, linewidth = 0.45) +
+  geom_text(
+    aes(y = pmax(percentage, ci_hi_pct, na.rm = TRUE) + 4, label = fmt_count_pct(n, percentage)),
+    size = 3.0,
+    lineheight = 0.9
+  ) +
+  scale_fill_manual(values = REASON_COLOR) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 100)) +
+  labs(title = "Reason for change", x = NULL, y = "Changed responses (%)") +
+  guides(fill = "none") +
+  coord_flip()
+
+p_decision_reason
+```
+
+```{r figure-finding-acceptance, fig.width=4.8, fig.height=4}
+n_reviews <- nrow(review_df)
+n_accepted <- sum(review_df$is_accepted, na.rm = TRUE)
+
+accept_tbl <- tibble(
+  status = c("Accepted", "Rejected"),
+  n = c(n_accepted, n_reviews - n_accepted),
+  denominator = n_reviews
+) |>
+  mutate(percentage = pct(n, denominator)) |>
+  add_wilson("n", "denominator")
+
+p_accept_overall <- ggplot(accept_tbl, aes(status, percentage, fill = status)) +
+  geom_col(width = 0.68, alpha = 0.9) +
+  geom_errorbar(aes(ymin = ci_lo_pct, ymax = ci_hi_pct), width = 0.2, linewidth = 0.45) +
+  geom_text(
+    aes(y = pmax(percentage, ci_hi_pct, na.rm = TRUE) + 4, label = fmt_count_pct(n, percentage)),
+    size = 3.0,
+    lineheight = 0.9
+  ) +
+  scale_fill_manual(values = STATUS_COLOR) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 100)) +
+  labs(title = "Finding acceptance", x = NULL, y = "Finding reviews (%)") +
+  guides(fill = "none")
+
+p_accept_overall
+ggsave("./figures/reader-study/finding_acceptance_overall.pdf", p_accept_overall, 
+        width = 4.8, height = 4, device = "pdf", bg = "white")
+```
+
+```{r figure-confidence-impact, fig.width=4.8, fig.height=4}
+n_boost <- nrow(boost_df)
+n_boost_yes <- sum(boost_df$visual_confidence_boost, na.rm = TRUE)
+
+boost_tbl <- tibble(
+  response = c("Yes", "No"),
+  n = c(n_boost_yes, n_boost - n_boost_yes),
+  denominator = n_boost
+) |>
+  mutate(percentage = pct(n, denominator)) |>
+  add_wilson("n", "denominator")
+
+p_boost_overall <- ggplot(boost_tbl, aes(response, percentage, fill = response)) +
+  geom_col(width = 0.68, alpha = 0.9) +
+  geom_errorbar(aes(ymin = ci_lo_pct, ymax = ci_hi_pct), width = 0.2, linewidth = 0.45) +
+  geom_text(
+    aes(y = pmax(percentage, ci_hi_pct, na.rm = TRUE) + 4, label = fmt_count_pct(n, percentage)),
+    size = 3.0,
+    lineheight = 0.9
+  ) +
+  scale_fill_manual(values = STATUS_COLOR) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 100)) +
+  labs(title = "Confidence impact", x = NULL, y = "Responses (%)") +
+  guides(fill = "none")
+
+p_boost_overall
+```
+
+```{r figure-interpretation-time, fig.width=4.8, fig.height=4}
+time_df <- time_df |>
+  mutate(
+    presentation_mode = factor(presentation_mode, levels = c("manual", "ai_assisted")),
+    mode_label = recode(as.character(presentation_mode), !!!MODE_LABEL)
+  )
+
+time_summary <- time_df |>
+  group_by(presentation_mode) |>
+  summarise(
+    n = n(),
+    mean_sec = mean(interpret_time_seconds, na.rm = TRUE),
+    median_sec = median(interpret_time_seconds, na.rm = TRUE),
+    sd_sec = sd(interpret_time_seconds, na.rm = TRUE),
+    min_sec = min(interpret_time_seconds, na.rm = TRUE),
+    max_sec = max(interpret_time_seconds, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(presentation_mode = recode(as.character(presentation_mode), !!!MODE_LABEL))
+
+manual_t <- time_df |> filter(presentation_mode == "manual") |> pull(interpret_time_seconds)
+ai_t <- time_df |> filter(presentation_mode == "ai_assisted") |> pull(interpret_time_seconds)
+t_p <- t.test(manual_t, ai_t, alternative = "greater")$p.value
+u_p <- wilcox.test(manual_t, ai_t, alternative = "greater", exact = FALSE)$p.value
+
+mean_boot <- bootstrap_diff_ci(manual_t, ai_t, mean)
+median_boot <- bootstrap_diff_ci(manual_t, ai_t, median)
+
+time_inferential <- tibble(
+  comparison = "Manual - AI-assisted",
+  n_manual = length(manual_t),
+  n_ai_assisted = length(ai_t),
+  mean_manual_sec = mean(manual_t, na.rm = TRUE),
+  mean_ai_assisted_sec = mean(ai_t, na.rm = TRUE),
+  mean_diff_sec = mean_boot$diff,
+  mean_diff_ci_low_sec = mean_boot$ci_lo,
+  mean_diff_ci_high_sec = mean_boot$ci_hi,
+  median_diff_sec = median_boot$diff,
+  median_diff_ci_low_sec = median_boot$ci_lo,
+  median_diff_ci_high_sec = median_boot$ci_hi,
+  welch_p_one_sided = t_p,
+  mann_whitney_p_one_sided = u_p,
+  cohens_d = cohens_d(manual_t, ai_t),
+  rank_biserial = rank_biserial(manual_t, ai_t)
+)
+
+p_time_mode <- ggplot(time_df, aes(presentation_mode, interpret_time_seconds, fill = presentation_mode)) +
+  geom_violin(alpha = 0.42, colour = NA, trim = FALSE) +
+  geom_boxplot(width = 0.18, fill = "white", outlier.shape = NA, linewidth = 0.45) +
+  geom_point(aes(colour = presentation_mode),
+    position = position_jitter(width = 0.10, height = 0),
+    alpha = 0.65, size = 1.3) + 
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 2.5, fill = "white") +
+  scale_x_discrete(labels = MODE_LABEL) + scale_fill_manual(values = MODE_COLOR) + scale_colour_manual(values = MODE_COLOR) +
+  labs(x = NULL, y = "Seconds") + guides(fill = "none", colour = "none")
+
+p_time_mode
+ggsave("./figures/reader-study/interpretation_time_by_mode.pdf", p_time_mode, 
+       width = 4.8, height = 4, device = "pdf")
+```
+
+```{r figure-confidence-context, fig.width=7.4, fig.height=4.2}
+ctx_tbl <- resp |>
+  filter(!is.na(visual_confidence_boost), !is.na(final_interpretation_source)) |>
+  mutate(visual_confidence_boost = as_bool_vec(visual_confidence_boost),
+         context_question = recode(final_interpretation_source, !!!CONTEXT_LABEL, .default = NA_character_)) |>
+  filter(!is.na(context_question)) |>
+  group_by(final_interpretation_source, context_question) |>
+  summarise(yes_n = sum(visual_confidence_boost, na.rm = TRUE), total_n = n(), .groups = "drop") |>
+  mutate(yes_rate_pct = pct(yes_n, total_n)) |>
+  add_wilson("yes_n", "total_n")
+
+p_conf_context <- ctx_tbl |>
+  mutate(context_question = fct_reorder(context_question, yes_rate_pct)) |>
+  ggplot(aes(context_question, yes_rate_pct, fill = final_interpretation_source)) +
+  geom_col(width = 0.62, alpha = 0.9) +
+  geom_errorbar(aes(ymin = ci_lo_pct, ymax = ci_hi_pct), width = 0.18, linewidth = 0.45) +
+  scale_fill_manual(values = CONTEXT_COLOR) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 120)) +
+  labs(title = "Confidence by final decision context", x = NULL, y = "Yes responses (%)") +
+  guides(fill = "none") +
+  coord_flip()
+
+p_conf_context
+```
+
+```{r participant-derived-data}
+name_map <- profiles |> select(id, full_name) |> deframe()
+
+# Resolve a user_id to the reader's real full name (kept internal; never plotted)
+participant_real_name <- function(user_id) coalesce(unname(name_map[user_id]), user_id)
+
+# Stable anonymisation: each real name -> "Reader N", numbered by response count
+# (most active = Reader 1). reader_label_map is the single source of truth so a
+# given reader keeps the same number across every figure.
+reader_order <- resp |>
+  mutate(real_name = participant_real_name(user_id)) |>
+  count(real_name, sort = TRUE) |>
+  pull(real_name)
+reader_label_map <- setNames(paste("Reader", seq_along(reader_order)), reader_order)
+
+# Public-facing identity used in all figures (anonymised)
+participant_name <- function(user_id) {
+  unname(reader_label_map[participant_real_name(user_id)])
+}
+
+resp_p <- resp |> mutate(participant = participant_name(user_id))
+part_order <- unname(reader_label_map[reader_order])
+```
+
+
+
+```{r figure-participant-time, fig.width=6, fig.height=4.5}
+time_df_p <- time_df |>
+  mutate(
+    participant = participant_name(user_id),
+    participant = factor(participant, levels = part_order)
+  )
+
+# Append a pooled "Overall" group (every participant together) as an extra axis category
+time_df_p <- bind_rows(
+  time_df_p |> mutate(participant = as.character(participant)),
+  time_df_p |> mutate(participant = "Overall")
+) |>
+  # Reader 1 -> Reader 7 top-to-bottom (last level sits at top after coord_flip),
+  # with the pooled "Overall" group at the bottom.
+  mutate(participant = factor(participant, levels = c("Overall", rev(part_order))))
+
+part_time_tbl <- time_df_p |>
+  group_by(participant, presentation_mode) |>
+  summarise(
+    n = n(),
+    mean_sec = mean(interpret_time_seconds),
+    median_sec = median(interpret_time_seconds),
+    sd_sec = sd(interpret_time_seconds),
+    .groups = "drop"
+  ) |>
+  mutate(presentation_mode = recode(as.character(presentation_mode), !!!MODE_LABEL))
+
+p_part_time <- ggplot(time_df_p, aes(participant, interpret_time_seconds, fill = presentation_mode)) +
+  geom_vline(
+    xintercept = 1.5,
+    linetype = "dashed",
+    colour = "grey60",
+    linewidth = 0.35
+  ) +
+  geom_boxplot(
+    position = position_dodge(width = 0.72),
+    outlier.shape = NA,
+    alpha = 0.35,
+    linewidth = 0.35
+  ) +
+  geom_point(
+    data = function(d) dplyr::filter(d, participant != "Overall"),
+    aes(colour = presentation_mode),
+    position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.72),
+    alpha = 0.62,
+    size = 1.15
+  ) +
+  stat_summary(
+    aes(group = presentation_mode),
+    fun = mean,
+    geom = "point",
+    position = position_dodge(width = 0.72),
+    shape = 23,
+    size = 2.2,
+    fill = "white"
+  ) +
+  scale_fill_manual(values = MODE_COLOR, labels = MODE_LABEL) +
+  scale_colour_manual(values = MODE_COLOR, labels = MODE_LABEL) +
+  labs(x = NULL, y = "Seconds") +
+  coord_flip()
+
+p_part_time
+ggsave("./figures/reader-study/interpretation_time_by_participant.pdf", p_part_time,
+       width = 6, height = 4.5, device = "pdf")
+```
+
+```{r figure-participant-decision-confidence, fig.width=9, fig.height=5.2}
+part_decision <- decision_df |>
+  mutate(participant = participant_name(user_id)) |>
+  group_by(participant) |>
+  summarise(decision_cases = n(), changed = sum(changed_decision, na.rm = TRUE), .groups = "drop") |>
+  bind_rows(
+    decision_df |>
+      summarise(participant = "Overall",
+                decision_cases = n(),
+                changed = sum(changed_decision, na.rm = TRUE))
+  ) |>
+  mutate(change_rate_pct = pct(changed, decision_cases)) |>
+  add_wilson("changed", "decision_cases", "change_ci")
+
+part_boost <- boost_df |>
+  mutate(
+    participant = participant_name(user_id),
+    visual_confidence_boost = as_bool_vec(visual_confidence_boost)
+  ) |>
+  group_by(participant) |>
+  summarise(boost_cases = n(), boost_yes = sum(visual_confidence_boost, na.rm = TRUE), .groups = "drop") |>
+  bind_rows(
+    boost_df |>
+      summarise(participant = "Overall",
+                boost_cases = n(),
+                boost_yes = sum(as_bool_vec(visual_confidence_boost), na.rm = TRUE))
+  ) |>
+  mutate(boost_rate_pct = pct(boost_yes, boost_cases)) |>
+  add_wilson("boost_yes", "boost_cases", "boost_ci")
+
+part_summary <- full_join(part_decision, part_boost, by = "participant") |>
+  arrange(match(participant, part_order))
+
+part_summary_long <- bind_rows(
+  part_summary |>
+    transmute(
+      participant,
+      metric = "Decision changed",
+      numerator = changed,
+      denominator = decision_cases,
+      percentage = change_rate_pct,
+      ci_lo_pct = change_ci_lo_pct,
+      ci_hi_pct = change_ci_hi_pct
+    ),
+  part_summary |>
+    transmute(
+      participant,
+      metric = "Confidence boosted",
+      numerator = boost_yes,
+      denominator = boost_cases,
+      percentage = boost_rate_pct,
+      ci_lo_pct = boost_ci_lo_pct,
+      ci_hi_pct = boost_ci_hi_pct
+    )
+) |>
+  # Reader 1 at top, readers descending, pooled "Overall" pinned to the bottom
+  mutate(participant = factor(participant, levels = c("Overall", rev(part_order))))
+
+p_part_decision_boost <- ggplot(part_summary_long, aes(participant, percentage, fill = metric)) +
+  geom_vline(xintercept = 1.5, linetype = "dashed", colour = "grey60", linewidth = 0.35) +
+  geom_col(width = 0.65, alpha = 0.9) +
+  geom_errorbar(aes(ymin = ci_lo_pct, ymax = ci_hi_pct), width = 0.2, linewidth = 0.38) +
+  geom_text(
+    aes(y = pmin(112, pmax(percentage, ci_hi_pct, na.rm = TRUE) + 4),
+        label = sprintf("%s/%s", numerator, denominator)),
+    size = 2.65
+  ) +
+  facet_wrap(~ metric, nrow = 1) +
+  scale_fill_manual(values = c("Decision changed" = col_visual, "Confidence boosted" = col_manual)) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 115)) +
+  labs(title = "Decision and confidence impact by participant", x = NULL, y = "Responses (%)") +
+  guides(fill = "none") +
+  coord_flip()
+
+p_part_decision_boost
+ggsave("./figures/reader-study/decision_confidence_by_participant.pdf", p_part_decision_boost,
+       width = 9, height = 5.2, device = "pdf")
+```
+
+```{r figure-participant-acceptance, fig.width=6.4, fig.height=5}
+reviews_linked <- if ("case_response_id" %in% names(reviews)) {
+  reviews |>
+    left_join(responses |> select(response_id_join = id, user_id),
+              by = c("case_response_id" = "response_id_join"))
+} else if ("response_id" %in% names(reviews) && !"user_id" %in% names(reviews)) {
+  reviews |>
+    left_join(responses |> select(response_id = id, user_id), by = "response_id")
+} else {
+  reviews
+}
+
+part_accept <- reviews_linked |>
+  filter(!is.na(is_accepted), !is.na(user_id)) |>
+  mutate(participant = participant_name(user_id)) |>
+  group_by(participant) |>
+  summarise(n_findings = n(), n_accepted = sum(is_accepted, na.rm = TRUE), .groups = "drop") |>
+  mutate(accept_rate_pct = pct(n_accepted, n_findings)) |>
+  add_wilson("n_accepted", "n_findings") |>
+  arrange(match(participant, part_order))
+
+p_part_accept <- part_accept |>
+  mutate(participant = factor(participant, levels = rev(part_order))) |>
+  ggplot(aes(participant, accept_rate_pct)) +
+  geom_col(fill = col_visual, width = 0.65, alpha = 0.9) +
+  geom_errorbar(aes(ymin = ci_lo_pct, ymax = ci_hi_pct), width = 0.2, linewidth = 0.38) +
+  geom_text(
+    aes(y = pmin(112, pmax(accept_rate_pct, ci_hi_pct, na.rm = TRUE) + 4),
+        label = sprintf("%s/%s", n_accepted, n_findings)),
+    size = 2.65
+  ) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 115)) +
+  labs(title = "Finding acceptance by participant", x = NULL, y = "Accepted findings (%)") +
+  coord_flip()
+
+p_part_accept
+ggsave("./figures/reader-study/finding_acceptance_by_participant.pdf", p_part_accept, 
+       width = 6.4, height = 4.8, device = "pdf")
+```
+
+```{r figure-difficulty-time, fig.width=7.4, fig.height=4.8}
+resp_d <- resp |>
+  left_join(case_difficulty, by = "case_id") |>
+  mutate(case_difficulty = factor(case_difficulty, levels = DIFF_ORDER))
+
+time_df_d <- time_df |>
+  left_join(case_difficulty, by = "case_id") |>
+  filter(!is.na(case_difficulty)) |>
+  mutate(
+    case_difficulty = factor(case_difficulty, levels = DIFF_ORDER),
+    presentation_mode = factor(presentation_mode, levels = c("manual", "ai_assisted"))
+  )
+
+diff_counts <- resp_d |>
+  filter(!is.na(case_difficulty)) |>
+  count(case_difficulty, name = "n_responses")
+
+diff_time_tbl <- time_df_d |>
+  group_by(case_difficulty, presentation_mode) |>
+  summarise(
+    n = n(),
+    mean_sec = mean(interpret_time_seconds),
+    median_sec = median(interpret_time_seconds),
+    sd_sec = sd(interpret_time_seconds),
+    min_sec = min(interpret_time_seconds),
+    max_sec = max(interpret_time_seconds),
+    .groups = "drop"
+  ) |>
+  mutate(presentation_mode = recode(as.character(presentation_mode), !!!MODE_LABEL))
+
+diff_inferential <- map_dfr(DIFF_ORDER, function(difficulty) {
+  sub <- time_df_d |> filter(case_difficulty == difficulty)
+  man <- sub |> filter(presentation_mode == "manual") |> pull(interpret_time_seconds)
+  ai <- sub |> filter(presentation_mode == "ai_assisted") |> pull(interpret_time_seconds)
+  boot <- bootstrap_diff_ci(man, ai, mean)
+  tibble(
+    case_difficulty = difficulty,
+    n_manual = length(man),
+    n_ai_assisted = length(ai),
+    mean_manual_sec = mean(man, na.rm = TRUE),
+    mean_ai_assisted_sec = mean(ai, na.rm = TRUE),
+    mean_diff_sec = boot$diff,
+    mean_diff_ci_low_sec = boot$ci_lo,
+    mean_diff_ci_high_sec = boot$ci_hi,
+    welch_p_one_sided = if (length(man) >= 2 && length(ai) >= 2) {
+      t.test(man, ai, alternative = "greater")$p.value
+    } else {
+      NA_real_
+    },
+    mann_whitney_p_one_sided = if (length(man) >= 2 && length(ai) >= 2) {
+      wilcox.test(man, ai, alternative = "greater", exact = FALSE)$p.value
+    } else {
+      NA_real_
+    }
+  )
+})
+
+p_diff_time <- ggplot(time_df_d, aes(case_difficulty, interpret_time_seconds, fill = presentation_mode)) +
+  geom_boxplot(
+    position = position_dodge(width = 0.78),
+    outlier.shape = NA,
+    alpha = 0.35,
+    linewidth = 0.35
+  ) +
+  geom_point(
+    aes(colour = presentation_mode),
+    position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.72),
+    alpha = 0.6,
+    size = 1.25
+  ) +
+  stat_summary(
+    aes(group = presentation_mode),
+    fun = mean,
+    geom = "point",
+    position = position_dodge(width = 0.72),
+    shape = 23,
+    size = 2.2,
+    fill = "white"
+  ) +
+  scale_x_discrete(labels = str_to_sentence) +
+  scale_fill_manual(values = MODE_COLOR, labels = MODE_LABEL) +
+  scale_colour_manual(values = MODE_COLOR, labels = MODE_LABEL) +
+  labs(title = "Interpretation time by difficulty", x = NULL, y = "Seconds")
+
+p_diff_time
+ggsave("./figures/reader-study/interpretation_time_by_difficulty.pdf", p_diff_time, 
+       width = 7.4, height = 4.8, device = "pdf")
+```
+
+```{r figure-difficulty-outcomes, fig.width=13.2, fig.height=4.2}
+decision_df_d <- decision_df |>
+  left_join(case_difficulty, by = "case_id") |>
+  filter(!is.na(case_difficulty)) |>
+  mutate(case_difficulty = factor(case_difficulty, levels = DIFF_ORDER))
+
+boost_df_d <- boost_df |>
+  left_join(case_difficulty, by = "case_id") |>
+  filter(!is.na(case_difficulty)) |>
+  mutate(
+    case_difficulty = factor(case_difficulty, levels = DIFF_ORDER),
+    visual_confidence_boost = as_bool_vec(visual_confidence_boost)
+  )
+
+diff_decision <- decision_df_d |>
+  group_by(case_difficulty) |>
+  summarise(decision_cases = n(), changed = sum(changed_decision, na.rm = TRUE), .groups = "drop") |>
+  complete(case_difficulty = factor(DIFF_ORDER, levels = DIFF_ORDER),
+           fill = list(decision_cases = 0L, changed = 0L)) |>
+  mutate(change_rate_pct = pct(changed, decision_cases)) |>
+  add_wilson("changed", "decision_cases", "change_ci")
+
+diff_boost <- boost_df_d |>
+  group_by(case_difficulty) |>
+  summarise(boost_cases = n(), boost_yes = sum(visual_confidence_boost, na.rm = TRUE), .groups = "drop") |>
+  complete(case_difficulty = factor(DIFF_ORDER, levels = DIFF_ORDER),
+           fill = list(boost_cases = 0L, boost_yes = 0L)) |>
+  mutate(boost_rate_pct = pct(boost_yes, boost_cases)) |>
+  add_wilson("boost_yes", "boost_cases", "boost_ci")
+
+diff_summary <- full_join(diff_decision, diff_boost, by = "case_difficulty") |>
+  arrange(case_difficulty)
+
+reviews_d <- reviews |>
+  left_join(case_difficulty, by = "case_id") |>
+  filter(!is.na(is_accepted), !is.na(case_difficulty)) |>
+  mutate(case_difficulty = factor(case_difficulty, levels = DIFF_ORDER))
+
+diff_accept <- reviews_d |>
+  group_by(case_difficulty) |>
+  summarise(n_findings = n(), n_accepted = sum(is_accepted, na.rm = TRUE), .groups = "drop") |>
+  complete(case_difficulty = factor(DIFF_ORDER, levels = DIFF_ORDER),
+           fill = list(n_findings = 0L, n_accepted = 0L)) |>
+  mutate(accept_rate_pct = pct(n_accepted, n_findings)) |>
+  add_wilson("n_accepted", "n_findings") |>
+  arrange(case_difficulty)
+
+p_diff_accept <- ggplot(diff_accept, aes(case_difficulty, accept_rate_pct, fill = case_difficulty)) +
+  geom_col(width = 0.65, alpha = 0.9) +
+  geom_errorbar(aes(ymin = ci_lo_pct, ymax = ci_hi_pct), width = 0.18, linewidth = 0.4) +
+  geom_text(
+    aes(y = pmin(112, pmax(accept_rate_pct, ci_hi_pct, na.rm = TRUE) + 4),
+        label = sprintf("%s/%s", n_accepted, n_findings)),
+    size = 2.8
+  ) +
+  scale_x_discrete(labels = str_to_sentence) +
+  scale_fill_manual(values = DIFF_COLOR) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 115)) +
+  labs(title = "Finding acceptance by difficulty", x = NULL, y = "Accepted findings (%)") +
+  guides(fill = "none")
+
+p_diff_confidence <- ggplot(diff_summary, aes(case_difficulty, boost_rate_pct, fill = case_difficulty)) +
+  geom_col(width = 0.65, alpha = 0.9) +
+  geom_errorbar(aes(ymin = boost_ci_lo_pct, ymax = boost_ci_hi_pct), width = 0.18, linewidth = 0.4) +
+  geom_text(
+    aes(y = pmin(112, pmax(boost_rate_pct, boost_ci_hi_pct, na.rm = TRUE) + 4),
+        label = sprintf("%s/%s", boost_yes, boost_cases)),
+    size = 2.8
+  ) +
+  scale_x_discrete(labels = str_to_sentence) +
+  scale_fill_manual(values = DIFF_COLOR) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 115)) +
+  labs(title = "Confidence boost by difficulty", x = NULL, y = "Confidence boosted (%)") +
+  guides(fill = "none")
+
+p_diff_decision <- ggplot(diff_summary, aes(case_difficulty, change_rate_pct, fill = case_difficulty)) +
+  geom_col(width = 0.65, alpha = 0.9) +
+  geom_errorbar(aes(ymin = change_ci_lo_pct, ymax = change_ci_hi_pct), width = 0.18, linewidth = 0.4) +
+  geom_text(
+    aes(y = pmin(112, pmax(change_rate_pct, change_ci_hi_pct, na.rm = TRUE) + 4),
+        label = sprintf("%s/%s", changed, decision_cases)),
+    size = 2.8
+  ) +
+  scale_x_discrete(labels = str_to_sentence) +
+  scale_fill_manual(values = DIFF_COLOR) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 115)) +
+  labs(title = "Decision changes by difficulty", x = NULL, y = "Decision changed (%)") +
+  guides(fill = "none")
+
+p_diff_decision_boost_accept <- ggarrange(
+  p_diff_accept,
+  p_diff_confidence,
+  p_diff_decision,
+  ncol = 3,
+  nrow = 1,
+  align = "hv"
+)
+
+ggsave(
+  file.path(SUPP_DIR, "per_difficulty_decision_boost_acceptance.pdf"),
+  plot = p_diff_decision_boost_accept,
+  width = 13.2,
+  height = 4.2,
+  device = "pdf",
+  bg = "white"
+)
+
+p_diff_decision_boost_accept
+```
+
+# Disease Recovery Figures
+
+```{r load-disease-recovery-data}
+disease_path <- file.path(RESPONSES_ROOT, "per_response_detailed.csv")
+if (!file.exists(disease_path)) {
+  stop("Missing disease recovery export: ", disease_path, call. = FALSE)
+}
+
+disease <- read_csv(disease_path, show_col_types = FALSE) |>
+  mutate(
+    across(c(gt_findings, human_caught, missed_by_human, recovered_by_AI),
+           ~ replace_na(as.integer(as.numeric(.x)), 0L)),
+    across(c(participant_name, case_difficulty, revision_reason, missed_conditions, recovered_conditions),
+           ~ replace_na(as.character(.x), "")),
+    human_missed_any = missed_by_human > 0,
+    ai_human_recovered_any = recovered_by_AI > 0,
+    recovered_due_to_visual_reasoning =
+      ai_human_recovered_any & revision_reason == "visual_reasoning_trace",
+    recovered_due_to_conflicting_ai =
+      ai_human_recovered_any & revision_reason == "conflicting_ai_interpretation"
+  )
+```
+
+```{r figure-ai-vs-humanai, fig.width=6, fig.height=4.2}
+metric_labels <- c(
+  bertscore = "BERTScore",
+  semb_score = "SemScore",
+  radgraph_combined = "RadGraph",
+  CE_f1 = "CE F1",
+  CE5_f1 = "CE5 F1"
+)
+
+human_vs_humanai_tbl <- imap_dfr(metric_labels, function(label, metric) {
+  human_col <- paste0("human_", metric)
+  humanai_col <- paste0("humanai_", metric)
+  paired <- tibble(
+    human = as.numeric(disease[[human_col]]),
+    humanai = as.numeric(disease[[humanai_col]])
+  ) |>
+    drop_na()
+  tibble(
+    metric = label,
+    human_mean = mean(paired$human, na.rm = TRUE),
+    humanai_mean = mean(paired$humanai, na.rm = TRUE),
+    delta_humanai_minus_human = mean(paired$humanai - paired$human),
+    n = nrow(paired)
+  )
+}) %>%
+  drop_na()
+
+ai_metric_long <- human_vs_humanai_tbl |>
+  select(metric, `Human alone` = human_mean, `AI + human final` = humanai_mean) |>
+  pivot_longer(-metric, names_to = "report", values_to = "mean_score")
+
+p_ai_vs_humanai <- ggplot(ai_metric_long, aes(metric, mean_score, fill = report)) +
+  geom_col(position = position_dodge(width = 0.72), width = 0.62, alpha = 0.9) +
+  geom_text(
+    data = human_vs_humanai_tbl,
+    aes(metric, pmax(human_mean, humanai_mean) + 0.055,
+        label = sprintf("Delta %+0.3f", delta_humanai_minus_human)),
+    inherit.aes = FALSE,
+    size = 2.7
+  ) +
+  scale_fill_manual(values = c("Human alone" = col_manual, "AI + human final" = col_visual)) +
+  scale_y_continuous(limits = c(0, 1.12), breaks = seq(0, 1, 0.25)) +
+  labs(x = NULL, y = "Mean score") + theme_bw()
+
+p_ai_vs_humanai
+ggsave("./figures/reader-study/human_vs_humanai_report_scores.pdf", p_ai_vs_humanai, 
+       width = 8.2, height = 4.2, device = "pdf")
+```
+
+```{r figure-overall-disease-recovery, fig.width=10.4, fig.height=4.4}
+total_gt_findings <- sum(disease$gt_findings, na.rm = TRUE)
+total_human_caught <- sum(disease$human_caught, na.rm = TRUE)
+total_missed <- sum(disease$missed_by_human, na.rm = TRUE)
+total_recovered <- sum(disease$recovered_by_AI, na.rm = TRUE)
+remaining_missed <- total_missed - total_recovered
+
+human_steps <- tibble(
+  status = c("Caught by human-only", "Missed by human-only"),
+  numerator = c(total_human_caught, total_missed),
+  denominator = total_gt_findings
+) |>
+  mutate(percentage = pct(numerator, denominator)) |>
+  add_wilson("numerator", "denominator")
+
+recovery_steps <- tibble(
+  status = c("Recovered by AI + human", "Still missed after AI + human"),
+  numerator = c(total_recovered, remaining_missed),
+  denominator = total_missed
+) |>
+  mutate(percentage = pct(numerator, denominator)) |>
+  add_wilson("numerator", "denominator")
+
+p_human_steps <- ggplot(human_steps, aes(status, percentage, fill = status)) +
+  geom_col(width = 0.64, alpha = 0.9) +
+  geom_errorbar(aes(ymin = ci_lo_pct, ymax = ci_hi_pct), width = 0.18, linewidth = 0.42) +
+  geom_text(
+    aes(y = pmax(percentage, ci_hi_pct, na.rm = TRUE) + 4,
+        label = sprintf("%.1f%%\n(%s/%s)", percentage, numerator, denominator)),
+    size = 3.0,
+    lineheight = 0.9
+  ) +
+  scale_fill_manual(values = c(
+    "Caught by human-only" = RECOVERY_COLOR[["human_caught"]],
+    "Missed by human-only" = RECOVERY_COLOR[["human_missed"]]
+  )) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 110)) +
+  labs(title = "Human-only disease finding status", x = NULL, y = "Reference findings (%)") +
+  guides(fill = "none")
+
+p_recovery_steps <- ggplot(recovery_steps, aes(status, percentage, fill = status)) +
+  geom_col(width = 0.64, alpha = 0.9) +
+  geom_errorbar(aes(ymin = ci_lo_pct, ymax = ci_hi_pct), width = 0.18, linewidth = 0.42) +
+  geom_text(
+    aes(y = pmax(percentage, ci_hi_pct, na.rm = TRUE) + 4,
+        label = sprintf("%.1f%%\n(%s/%s)", percentage, numerator, denominator)),
+    size = 3.0,
+    lineheight = 0.9
+  ) +
+  scale_fill_manual(values = c(
+    "Recovered by AI + human" = RECOVERY_COLOR[["recovered"]],
+    "Still missed after AI + human" = RECOVERY_COLOR[["remaining"]]
+  )) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 110)) +
+  labs(title = "AI + human outcome among human-missed findings", x = NULL, y = "Human-missed findings (%)") +
+  guides(fill = "none")
+
+p_overall_recovery <- p_human_steps + p_recovery_steps + plot_layout(ncol = 2)
+
+p_overall_recovery
+```
+
+```{r figure-visual-reasoning-attribution, fig.width=9.6, fig.height=4.5}
+recovered_df <- disease |> filter(ai_human_recovered_any)
+
+reason_response <- recovered_df |>
+  mutate(reason_label = recode(
+    revision_reason,
+    visual_reasoning_trace = "Visual reasoning trace",
+    conflicting_ai_interpretation = "Conflicting AI interpretation",
+    .default = "No recorded reason",
+    .missing = "No recorded reason"
+  )) |>
+  group_by(reason_label) |>
+  summarise(responses = n(), recovered_findings = sum(recovered_by_AI), .groups = "drop") |>
+  mutate(
+    response_pct = pct(responses, sum(responses)),
+    finding_weighted_pct = pct(recovered_findings, sum(recovered_findings))
+  ) |>
+  arrange(desc(finding_weighted_pct))
+
+attribution_long <- bind_rows(
+  reason_response |>
+    transmute(reason_label, endpoint = "Response-level attribution", value = response_pct, n = responses),
+  reason_response |>
+    transmute(reason_label, endpoint = "Finding-weighted attribution", value = finding_weighted_pct, n = recovered_findings)
+)
+
+p_visual_attribution <- attribution_long |>
+  mutate(reason_label = fct_reorder(reason_label, value)) |>
+  ggplot(aes(reason_label, value, fill = reason_label)) +
+  geom_col(width = 0.66, alpha = 0.9) +
+  geom_text(
+    aes(y = value + 4, label = sprintf("%.1f%%\n(n=%s)", value, n)),
+    size = 2.9,
+    lineheight = 0.9
+  ) +
+  facet_wrap(~ endpoint, nrow = 1) +
+  scale_fill_manual(values = c(
+    "Visual reasoning trace" = RECOVERY_COLOR[["visual_reasoning"]],
+    "Conflicting AI interpretation" = RECOVERY_COLOR[["conflicting_ai"]],
+    "No recorded reason" = RECOVERY_COLOR[["other"]]
+  )) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 105)) +
+  labs(title = "Attribution among recovered responses", x = NULL, y = "Recovered share (%)") +
+  guides(fill = "none") +
+  coord_flip()
+
+p_visual_attribution
+```
+
+```{r figure-condition-level-recovery, fig.width=11.2, fig.height=5.8}
+split_conditions <- function(x) {
+  str_split(replace_na(as.character(x), ""), ";") |>
+    unlist(use.names = FALSE) |>
+    str_trim() |>
+    purrr::discard(~ .x == "")
+}
+
+missed_condition_tbl <- tibble(condition = split_conditions(disease$missed_conditions)) |>
+  count(condition, name = "missed_by_human")
+recovered_condition_tbl <- tibble(condition = split_conditions(disease$recovered_conditions)) |>
+  count(condition, name = "recovered_by_AI")
+
+condition_tbl <- full_join(missed_condition_tbl, recovered_condition_tbl, by = "condition") |>
+  mutate(
+    across(c(missed_by_human, recovered_by_AI), ~ replace_na(.x, 0L)),
+    recovery_rate_pct = pct(recovered_by_AI, missed_by_human)
+  ) |>
+  arrange(desc(recovered_by_AI), desc(missed_by_human))
+
+disease_condition_tbl <- condition_tbl |>
+  filter(condition != "No Finding") |>
+  arrange(missed_by_human) |>
+  mutate(condition = factor(condition, levels = condition))
+
+p_condition_missed <- ggplot(disease_condition_tbl, aes(condition, missed_by_human)) +
+  geom_col(fill = RECOVERY_COLOR[["human_missed"]], width = 0.68, alpha = 0.9) +
+  geom_text(aes(y = missed_by_human + 0.35, label = paste0("n=", missed_by_human)),
+            hjust = 0, size = 2.7) +
+  labs(title = "Disease instances missed by human-only", x = NULL, y = "Instances") +
+  coord_flip()
+
+p_condition_recovery <- ggplot(disease_condition_tbl, aes(condition, recovery_rate_pct)) +
+  geom_col(fill = RECOVERY_COLOR[["recovered"]], width = 0.68, alpha = 0.9) +
+  geom_text(
+    aes(y = pmin(96, recovery_rate_pct + 2),
+        label = sprintf("%.1f%% (%s/%s)", recovery_rate_pct, recovered_by_AI, missed_by_human)),
+    hjust = 0,
+    size = 2.7
+  ) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 105)) +
+  labs(title = "Recovered after AI + human", x = NULL, y = "Recovered among human-missed (%)") +
+  coord_flip()
+
+p_condition_level <- p_condition_missed + p_condition_recovery + plot_layout(ncol = 2)
+
+p_condition_level
+ggsave("./figures/reader-study/condition_level_recovery.pdf", p_condition_level, 
+       width = 11.2, height = 5.8, device = "pdf")
+```
+
+```{r figure-participant-recovery, fig.width=6.8, fig.height=4.6}
+participant_recovery <- disease |>
+  mutate(participant_name = recode(participant_name, !!!reader_label_map)) |>
+  group_by(participant_name) |>
+  summarise(
+    responses = n(),
+    missed_findings = sum(missed_by_human),
+    recovered_findings = sum(recovered_by_AI),
+    recovered_responses = sum(ai_human_recovered_any),
+    visual_reasoning_recovered_responses = sum(recovered_due_to_visual_reasoning),
+    .groups = "drop"
+  ) |>
+  mutate(
+    finding_recovery_rate_pct = pct(recovered_findings, missed_findings),
+    visual_reasoning_among_recovered_pct = pct(visual_reasoning_recovered_responses, recovered_responses)
+  ) |>
+  arrange(desc(missed_findings))
+
+p_participant_recovery <- participant_recovery |>
+  mutate(participant_name = fct_reorder(participant_name, finding_recovery_rate_pct)) |>
+  ggplot(aes(participant_name, finding_recovery_rate_pct)) +
+  geom_col(fill = RECOVERY_COLOR[["recovered"]], width = 0.66, alpha = 0.9) +
+  geom_text(
+    aes(y = pmin(104, finding_recovery_rate_pct + 2),
+        label = sprintf("%s/%s", recovered_findings, missed_findings)),
+    hjust = 0,
+    size = 2.7
+  ) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 110)) +
+  labs(title = "Recovery by participant", x = NULL, y = "Recovered findings (%)") +
+  coord_flip()
+
+p_participant_recovery
+```
+
+```{r figure-difficulty-recovery, fig.width=5.8, fig.height=4.4}
+difficulty_recovery <- disease |>
+  mutate(case_difficulty = factor(case_difficulty, levels = DIFF_ORDER)) |>
+  group_by(case_difficulty) |>
+  summarise(
+    responses = n(),
+    missed_findings = sum(missed_by_human),
+    recovered_findings = sum(recovered_by_AI),
+    recovered_responses = sum(ai_human_recovered_any),
+    visual_reasoning_recovered_responses = sum(recovered_due_to_visual_reasoning),
+    .groups = "drop"
+  ) |>
+  mutate(
+    finding_recovery_rate_pct = pct(recovered_findings, missed_findings),
+    visual_reasoning_among_recovered_pct = pct(visual_reasoning_recovered_responses, recovered_responses)
+  )
+
+p_difficulty_recovery <- ggplot(difficulty_recovery, aes(case_difficulty, finding_recovery_rate_pct, fill = case_difficulty)) +
+  geom_col(width = 0.66, alpha = 0.9) +
+  geom_text(
+    aes(y = pmin(104, finding_recovery_rate_pct + 3),
+        label = sprintf("%s/%s", recovered_findings, missed_findings)),
+    size = 2.9
+  ) +
+  scale_x_discrete(labels = str_to_sentence) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 110)) +
+  scale_fill_manual(values = DIFF_COLOR) +
+  labs(title = "Recovery by difficulty", x = NULL, y = "Recovered findings (%)") +
+  guides(fill = "none")
+
+p_difficulty_recovery
+```
+
+# Standalone Composite
+
+```{r figure-readerstudy-main, fig.width=16, fig.height=33}
+figure_readerstudy <- (
+  (p_time_mode | p_time_boot) /
+    (p_decision_rate | p_decision_reason | p_accept_overall | p_boost_overall) /
+    (p_conf_context | p_diff_time) /
+    p_part_time /
+    (p_part_decision_boost | p_part_accept) /
+    p_diff_decision_boost_accept /
+    p_ai_vs_humanai /
+    p_overall_recovery /
+    (p_visual_attribution | p_difficulty_recovery) /
+    p_condition_level /
+    p_participant_recovery
+) +
+  plot_layout(heights = c(1.0, 1.0, 1.0, 1.2, 1.1, 1.0, 0.9, 1.0, 1.0, 1.35, 0.95)) +
+  plot_annotation(
+    
+    title = "Reader study analysis",
+    subtitle = paste0(
+      response_version, "; ",
+      length(complete_user_ids), " complete readers; ",
+      nrow(responses), " responses"
+    ),
+    tag_levels = "A"
+  ) &
+  theme(
+    plot.tag = element_text(face = "bold", size = 12),
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 10, colour = "grey35")
+  )
+
+ggsave(
+  file.path(FIG_DIR, "figure-readerstudy.pdf"),
+  plot = figure_readerstudy,
+  width = 16,
+  height = 33,
+  device = "pdf",
+  bg = "white"
+)
+
+figure_readerstudy
+```

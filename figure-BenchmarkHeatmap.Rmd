@@ -1,0 +1,959 @@
+---
+title: "figure-BenchmarkHeatmap"
+author: "Harry Robertson"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 18,
+  fig.height = 5.5,
+  dpi = 600
+)
+
+library(tidyverse)
+library(scales)
+library(funkyheatmap)
+
+RESULTS <- "results"
+FIG_DIR <- "main-figures"
+dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
+
+N_BOOT <- 10000
+SEED   <- 42
+
+source("./figure2-helpers.R")
+
+move_column_names_bottom <- function(geom_positions, position_args,
+                                     label_gap = 0.35,
+                                     tick_gap = 0.12) {
+  row_bottom <- min(geom_positions$row_pos$ymin, na.rm = TRUE)
+  label_height <- position_args$col_annot_offset
+  label_top <- row_bottom - label_gap
+  label_bottom <- label_top - label_height
+
+  text_data <- geom_positions$text_data
+  if (nrow(text_data) > 0 && "angle" %in% names(text_data)) {
+    is_column_name <- !is.na(text_data$angle) &
+      text_data$angle == position_args$col_annot_angle &
+      !is.na(text_data$ymin) &
+      !is.na(text_data$ymax) &
+      abs(text_data$ymin) < 1e-9 &
+      abs(text_data$ymax - position_args$col_annot_offset) < 1e-9
+
+    text_data$ymin[is_column_name] <- label_bottom
+    text_data$ymax[is_column_name] <- label_top
+    text_data$hjust[is_column_name] <- 1
+    geom_positions$text_data <- text_data
+  }
+
+  segment_data <- geom_positions$segment_data
+  if (nrow(segment_data) > 0) {
+    is_column_tick <- !is.na(segment_data$y) &
+      !is.na(segment_data$yend) &
+      abs(segment_data$y + 0.3) < 1e-9 &
+      abs(segment_data$yend + 0.1) < 1e-9
+
+    segment_data$y[is_column_tick] <- row_bottom - tick_gap - 0.18
+    segment_data$yend[is_column_tick] <- row_bottom - tick_gap
+    geom_positions$segment_data <- segment_data
+  }
+
+  geom_positions$bounds <- NULL
+  geom_positions
+}
+
+funky_heatmap_bottom_column_names <- function(
+    data,
+    column_info = NULL,
+    row_info = NULL,
+    column_groups = NULL,
+    row_groups = NULL,
+    palettes = NULL,
+    legends = NULL,
+    position_args = position_arguments(),
+    scale_column = TRUE,
+    add_abc = TRUE
+) {
+  verify_data <- getFromNamespace("verify_data", "funkyheatmap")
+  verify_column_info <- getFromNamespace("verify_column_info", "funkyheatmap")
+  verify_row_info <- getFromNamespace("verify_row_info", "funkyheatmap")
+  verify_column_groups <- getFromNamespace("verify_column_groups", "funkyheatmap")
+  verify_row_groups <- getFromNamespace("verify_row_groups", "funkyheatmap")
+  verify_palettes <- getFromNamespace("verify_palettes", "funkyheatmap")
+  verify_legends <- getFromNamespace("verify_legends", "funkyheatmap")
+  calculate_geom_positions <- getFromNamespace("calculate_geom_positions", "funkyheatmap")
+  compose_ggplot <- getFromNamespace("compose_ggplot", "funkyheatmap")
+
+  data <- verify_data(data)
+  column_info <- verify_column_info(column_info, data)
+  row_info <- verify_row_info(row_info, data)
+  column_groups <- verify_column_groups(column_groups, column_info)
+  row_groups <- verify_row_groups(row_groups, row_info)
+  palettes <- verify_palettes(palettes, column_info, data)
+  legends <- verify_legends(legends, palettes, column_info, data)
+
+  geom_positions <- calculate_geom_positions(
+    data, column_info, row_info, column_groups, row_groups,
+    palettes, position_args, scale_column, add_abc
+  ) |>
+    move_column_names_bottom(position_args)
+
+  main_plot <- compose_ggplot(geom_positions, position_args)
+
+  legend_funs <- list(
+    funkyrect = getFromNamespace("create_funkyrect_legend", "funkyheatmap"),
+    circle = getFromNamespace("create_circle_legend", "funkyheatmap"),
+    rect = getFromNamespace("create_rect_legend", "funkyheatmap"),
+    pie = getFromNamespace("create_pie_legend", "funkyheatmap"),
+    text = getFromNamespace("create_text_legend", "funkyheatmap"),
+    image = getFromNamespace("create_image_legend", "funkyheatmap"),
+    bar = getFromNamespace("create_bar_legend", "funkyheatmap")
+  )
+
+  legend_plots <- list()
+  for (legend in legends) {
+    if (legend$enabled) {
+      legend_fun <- legend_funs[[legend$geom]]
+      legend_args <- legend
+      legend_args$geom <- NULL
+      legend_args$enabled <- NULL
+      legend_args$palette <- NULL
+      legend_args$position_args <- position_args
+      legend_plots <- c(legend_plots, list(do.call(legend_fun, legend_args)))
+    }
+  }
+
+  if (length(legend_plots) == 0) return(main_plot)
+
+  legend_widths <- map_dbl(legend_plots, ~ .x$width)
+  legend_heights <- map_dbl(legend_plots, ~ .x$height)
+  heights <- c(main_plot$height, 0.1, max(legend_heights))
+  width <- max(main_plot$width, sum(legend_widths))
+
+  out <- patchwork::wrap_plots(
+    main_plot,
+    patchwork::plot_spacer(),
+    patchwork::wrap_plots(legend_plots, nrow = 1, widths = legend_widths),
+    ncol = 1,
+    heights = heights
+  )
+  out$width <- width
+  out$height <- sum(heights)
+  out
+}
+```
+
+```{r metric-specs}
+RG_NLG_METRICS <- c("bleu1", "bleu2", "bleu4", "meteor", "rougel", "cider")
+RG_SEM_METRICS <- c("bertscore", "semb_score", "radgraph_combined")
+RG_CE_METRICS  <- c("CE_precision",  "CE_recall",  "CE_f1",
+                    "CE5_precision", "CE5_recall", "CE5_f1")
+VQA_METRICS <- c("exact_match", "contains_match", "token_recall", "token_f1")
+
+METRIC_LABELS <- c(
+  bleu1 = "BLEU-1",
+  bleu2 = "BLEU-2",
+  bleu4 = "BLEU-4",
+  meteor = "METEOR",
+  rougel = "ROUGE-L",
+  cider = "CIDEr",
+  bertscore = "BERTScore",
+  semb_score = "SEMB",
+  radgraph_combined = "RadGraph F1",
+  CE_precision = "CE14 precision",
+  CE_recall = "CE14 recall",
+  CE_f1 = "CE14 F1",
+  CE5_precision = "CE5 precision",
+  CE5_recall = "CE5 recall",
+  CE5_f1 = "CE5 F1",
+  exact_match = "Exact match",
+  contains_match = "Contains match",
+  token_recall = "Token recall",
+  token_f1 = "Token F1"
+)
+
+metric_specs <- tribble(
+  ~dataset,     ~task, ~family,     ~group,              ~palette,       ~metric,
+  "MIMIC-CXR",  "RG",  "NLG",       "nlg_mimic",         "nlg",          list(RG_NLG_METRICS),
+  "IU X-ray",   "RG",  "NLG",       "nlg_iu",            "nlg",          list(RG_NLG_METRICS),
+  "MIMIC-CXR",  "RG",  "Semantic",  "semantic_mimic",    "semantic",     list(RG_SEM_METRICS),
+  "IU X-ray",   "RG",  "Semantic",  "semantic_iu",       "semantic",     list(RG_SEM_METRICS),
+  "MIMIC-CXR",  "RG",  "Clinical",  "clinical_mimic",    "clinical",     list(RG_CE_METRICS),
+  "IU X-ray",   "RG",  "Clinical",  "clinical_iu",       "clinical",     list(RG_CE_METRICS)
+) |>
+  mutate(metric = map(metric, unlist)) |>
+  unnest_longer(metric) |>
+  group_by(dataset, task, family) |>
+  mutate(
+    metric_index = row_number(),
+    metric_label = recode(metric, !!!METRIC_LABELS),
+    column_id = paste(group, metric, sep = "__")
+  ) |>
+  ungroup()
+
+data_sources <- tribble(
+  ~dataset,    ~task, ~directory,
+  "MIMIC-CXR", "RG",  file.path(RESULTS, "performance/rg/mimic_cxr"),
+  "IU X-ray",  "RG",  file.path(RESULTS, "performance/rg/iu_xray")
+)
+
+MODALITY_LEVELS <- c("CT", "MRI", "X-Ray")
+ORGAN_LEVELS <- c(
+  "Abdomen", "Brain", "Brain_Face", "Brain_Tissue",
+  "Chest_mediastinal", "Lung", "Neck", "Pelvic Cavity"
+)
+CONTENT_TYPE_LEVELS <- c(
+  "Abnormality", "Color", "KG", "Modality", "Organ",
+  "Plane", "Position", "Quantity", "Shape", "Size"
+)
+```
+
+```{r data}
+merge_model_variants <- function(per_sample) {
+  per_sample |>
+    mutate(
+      model = if_else(
+        model %in% c("internvl3_8b", "internvl3_5_8b") |
+          model_label %in% c("InternVL3 8B", "InternVL3.5 8B"),
+        "internvl3_8b",
+        model
+      ),
+      model_label = if_else(
+        model == "internvl3_8b",
+        "InternVL3 8B",
+        model_label
+      )
+    )
+}
+
+load_block_summary <- function(dataset_name, task_name, directory) {
+  block_specs <- metric_specs |>
+    filter(dataset == dataset_name, task == task_name)
+  required_metrics <- unique(block_specs$metric)
+
+  per_sample <- load_per_sample(directory) |>
+    merge_model_variants()
+  missing_metrics <- setdiff(required_metrics, names(per_sample))
+  if (length(missing_metrics) > 0) {
+    stop(
+      "Missing metric columns in ", directory, ": ",
+      paste(missing_metrics, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  build_summary(per_sample, required_metrics) |>
+    select(model_label, all_of(required_metrics)) |>
+    pivot_longer(
+      cols = all_of(required_metrics),
+      names_to = "metric",
+      values_to = "raw_value"
+    ) |>
+    left_join(block_specs, by = "metric") |>
+    select(dataset, task, family, group, palette, metric, metric_label,
+           metric_index, column_id, model_label, raw_value)
+}
+
+benchmark_long <- pmap_dfr(
+  data_sources,
+  \(dataset, task, directory) load_block_summary(dataset, task, directory)
+)
+
+normalise_metric <- function(x) {
+  range_x <- range(x, na.rm = TRUE)
+  if (!all(is.finite(range_x))) return(rep(NA_real_, length(x)))
+  if (isTRUE(all.equal(range_x[1], range_x[2]))) return(rep(1, length(x)))
+  rescale(x, to = c(0, 1), from = range_x)
+}
+
+benchmark_long <- benchmark_long |>
+  group_by(dataset, task, family, metric) |>
+  mutate(norm_value = normalise_metric(raw_value)) |>
+  ungroup()
+
+if (any(!is.na(benchmark_long$norm_value) &
+        (benchmark_long$norm_value < 0 | benchmark_long$norm_value > 1))) {
+  stop("Normalised heatmap values must be in [0, 1].", call. = FALSE)
+}
+
+model_order <- c(
+  "VReason",
+  "Qwen3-VL 8B",
+  "Qwen2.5-VL 7B",
+  "LLaMA-3.2 11B",
+  "InternVL3 8B",
+  "Phi-3.5 Vision",
+  "Gemma-3 4B"
+)
+
+present_models <- intersect(model_order, unique(benchmark_long$model_label))
+extra_models <- setdiff(unique(benchmark_long$model_label), present_models)
+plot_models <- c(present_models, sort(extra_models))
+
+plot_data <- benchmark_long |>
+  select(model_label, column_id, norm_value) |>
+  pivot_wider(names_from = column_id, values_from = norm_value) |>
+  mutate(
+    overall = rowMeans(across(where(is.numeric)), na.rm = TRUE),
+    id = model_label,
+    row_group = if_else(model_label == "VReason", "proposed", "vlm")
+  ) |>
+  arrange(match(model_label, plot_models)) |>
+  select(id, overall, all_of(metric_specs$column_id), row_group)
+
+if (any(!is.finite(plot_data$overall))) {
+  stop("Overall heatmap scores could not be computed.", call. = FALSE)
+}
+
+plot_matrix <- plot_data |>
+  select(-row_group)
+```
+
+```{r vqa-strata-data}
+pretty_stratum <- function(x) {
+  str_replace_all(x, "_", " ")
+}
+
+safe_column_token <- function(x) {
+  x |>
+    str_replace_all("[^A-Za-z0-9]+", "_") |>
+    str_replace_all("^_|_$", "") |>
+    str_to_lower()
+}
+
+vqa_strata_specs <- bind_rows(
+  tibble(
+    stratum_type = "modality",
+    stratum_type_label = "modality",
+    source_col = "modality",
+    stratum = MODALITY_LEVELS,
+    stratum_label = MODALITY_LEVELS,
+    stratum_order = seq_along(MODALITY_LEVELS)
+  ),
+  tibble(
+    stratum_type = "location",
+    stratum_type_label = "organ",
+    source_col = "location",
+    stratum = ORGAN_LEVELS,
+    stratum_label = pretty_stratum(ORGAN_LEVELS),
+    stratum_order = seq_along(ORGAN_LEVELS)
+  ),
+  tibble(
+    stratum_type = "content_type",
+    stratum_type_label = "content_type",
+    source_col = "content_type",
+    stratum = CONTENT_TYPE_LEVELS,
+    stratum_label = CONTENT_TYPE_LEVELS,
+    stratum_order = seq_along(CONTENT_TYPE_LEVELS)
+  )
+)
+
+vqa_slake_ps <- load_per_sample(file.path(RESULTS, "performance/vqa/slake")) |>
+  merge_model_variants()
+
+missing_vqa_metrics <- setdiff(VQA_METRICS, names(vqa_slake_ps))
+if (length(missing_vqa_metrics) > 0) {
+  stop(
+    "Missing VQA metric columns: ",
+    paste(missing_vqa_metrics, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+vqa_strata_long <- pmap_dfr(
+  vqa_strata_specs,
+  \(stratum_type, stratum_type_label, source_col,
+    stratum, stratum_label, stratum_order) {
+    vqa_slake_ps |>
+      filter(.data[[source_col]] == stratum) |>
+      select(model_label, all_of(VQA_METRICS)) |>
+      pivot_longer(all_of(VQA_METRICS), names_to = "metric", values_to = "value") |>
+      group_by(model_label, metric) |>
+      summarise(raw_value = mean(value, na.rm = TRUE), .groups = "drop") |>
+      mutate(
+        stratum_type = stratum_type,
+        stratum_type_label = stratum_type_label,
+        stratum = stratum,
+        stratum_label = stratum_label,
+        stratum_order = stratum_order
+      )
+  }
+) |>
+  mutate(
+    metric = factor(metric, levels = VQA_METRICS),
+    metric_label = recode(as.character(metric), !!!METRIC_LABELS),
+    group = paste("vqa", stratum_type, sep = "__"),
+    palette = paste0("vqa_", stratum_type),
+    column_id = paste(group, safe_column_token(stratum_label), sep = "__")
+  ) |>
+  arrange(metric, factor(stratum_type, levels = c("modality", "location", "content_type")),
+          stratum_order)
+
+vqa_strata_long <- vqa_strata_long |>
+  group_by(metric, stratum_type, stratum) |>
+  mutate(norm_value = normalise_metric(raw_value)) |>
+  ungroup()
+
+if (any(!is.na(vqa_strata_long$norm_value) &
+        (vqa_strata_long$norm_value < 0 | vqa_strata_long$norm_value > 1))) {
+  stop("Normalised VQA heatmap values must be in [0, 1].", call. = FALSE)
+}
+
+vqa_column_order <- vqa_strata_long |>
+  distinct(column_id, stratum_type, stratum_order) |>
+  arrange(factor(stratum_type, levels = c("modality", "location", "content_type")),
+          stratum_order) |>
+  pull(column_id)
+
+vqa_plot_data <- vqa_strata_long |>
+  mutate(
+    metric = factor(metric, levels = VQA_METRICS),
+    row_id = paste(as.character(metric), model_label, sep = "__"),
+    row_group = paste0("metric__", safe_column_token(as.character(metric)))
+  ) |>
+  select(row_id, model_label, row_group, metric, metric_label, column_id, norm_value) |>
+  pivot_wider(
+    id_cols = c(row_id, model_label, row_group, metric, metric_label),
+    names_from = column_id,
+    values_from = norm_value
+  ) |>
+  mutate(
+    overall = rowMeans(across(all_of(vqa_column_order)), na.rm = TRUE),
+    id = row_id
+  ) |>
+  arrange(metric, match(model_label, plot_models)) |>
+  select(id, metric, metric_label, overall, all_of(vqa_column_order), row_group, model_label)
+
+if (any(!is.finite(vqa_plot_data$overall))) {
+  stop("Overall VQA heatmap scores could not be computed.", call. = FALSE)
+}
+
+vqa_plot_matrix <- vqa_plot_data |>
+  select(-row_group, -metric, -metric_label)
+
+vqa_answer_type_strata_long <- pmap_dfr(
+  vqa_strata_specs,
+  \(stratum_type, stratum_type_label, source_col,
+    stratum, stratum_label, stratum_order) {
+    vqa_slake_ps |>
+      filter(
+        answer_type %in% c("OPEN", "CLOSED"),
+        .data[[source_col]] == stratum
+      ) |>
+      group_by(answer_type, model_label) |>
+      summarise(raw_value = mean(token_f1, na.rm = TRUE), .groups = "drop") |>
+      mutate(
+        stratum_type = stratum_type,
+        stratum_type_label = stratum_type_label,
+        stratum = stratum,
+        stratum_label = stratum_label,
+        stratum_order = stratum_order
+      )
+  }
+) |>
+  mutate(
+    answer_type = factor(answer_type, levels = c("OPEN", "CLOSED")),
+    answer_type_label = recode(
+      as.character(answer_type),
+      OPEN = "OPEN questions",
+      CLOSED = "CLOSED questions"
+    ),
+    group = paste("vqa", stratum_type, sep = "__"),
+    palette = paste0("vqa_", stratum_type),
+    column_id = paste(group, safe_column_token(stratum_label), sep = "__")
+  ) |>
+  arrange(
+    answer_type,
+    factor(stratum_type, levels = c("modality", "location", "content_type")),
+    stratum_order
+  )
+
+vqa_answer_type_strata_long <- vqa_answer_type_strata_long |>
+  group_by(answer_type, stratum_type, stratum) |>
+  mutate(norm_value = normalise_metric(raw_value)) |>
+  ungroup()
+
+if (any(!is.na(vqa_answer_type_strata_long$norm_value) &
+        (vqa_answer_type_strata_long$norm_value < 0 |
+         vqa_answer_type_strata_long$norm_value > 1))) {
+  stop("Normalised answer-type VQA heatmap values must be in [0, 1].", call. = FALSE)
+}
+
+vqa_answer_type_column_order <- vqa_answer_type_strata_long |>
+  distinct(column_id, stratum_type, stratum_order) |>
+  arrange(
+    factor(stratum_type, levels = c("modality", "location", "content_type")),
+    stratum_order
+  ) |>
+  pull(column_id)
+
+vqa_answer_type_plot_data <- vqa_answer_type_strata_long |>
+  mutate(
+    row_id = paste(as.character(answer_type), model_label, sep = "__"),
+    row_group = paste0("answer_type__", safe_column_token(as.character(answer_type)))
+  ) |>
+  select(row_id, model_label, row_group, answer_type, answer_type_label,
+         column_id, norm_value) |>
+  pivot_wider(
+    id_cols = c(row_id, model_label, row_group, answer_type, answer_type_label),
+    names_from = column_id,
+    values_from = norm_value
+  ) |>
+  mutate(
+    overall = rowMeans(across(all_of(vqa_answer_type_column_order)), na.rm = TRUE),
+    id = row_id
+  ) |>
+  arrange(answer_type, match(model_label, plot_models)) |>
+  select(id, answer_type, answer_type_label, overall,
+         all_of(vqa_answer_type_column_order), row_group, model_label)
+
+if (any(!is.finite(vqa_answer_type_plot_data$overall))) {
+  stop("Overall answer-type VQA heatmap scores could not be computed.", call. = FALSE)
+}
+
+vqa_answer_type_plot_matrix <- vqa_answer_type_plot_data |>
+  select(-row_group, -answer_type, -answer_type_label)
+```
+
+# Data Coverage
+
+```{r coverage-table}
+coverage <- data_sources |>
+  mutate(per_sample = map(directory, \(x) load_per_sample(x) |> merge_model_variants())) |>
+  transmute(
+    dataset,
+    task,
+    models = map_int(per_sample, \(x) n_distinct(x$model_label)),
+    examples_per_model = map_chr(
+      per_sample,
+      \(x) x |> count(model_label) |> pull(n) |> unique() |> sort() |> paste(collapse = ", ")
+    )
+  )
+
+coverage
+```
+
+# Benchmark Summary Heatmap
+
+```{r heatmap, fig.width=18, fig.height=5.5}
+build_rg_column_info <- function(specs) {
+  bind_rows(
+    tibble(
+      id = "id",
+      group = "model",
+      name = "",
+      geom = "text",
+      palette = NA_character_,
+      width = 4.4,
+      legend = FALSE,
+      hjust = 0
+    ),
+    tibble(
+      id = "overall",
+      group = "overall",
+      name = "Overall",
+      geom = "bar",
+      palette = "overall",
+      width = 2.2,
+      legend = TRUE,
+      hjust = 0
+    ),
+    specs |>
+      transmute(
+        id = column_id,
+        group,
+        name = metric_label,
+        geom = "circle",
+        palette,
+        width = 1,
+        legend = FALSE,
+        hjust = NA_real_
+      )
+  )
+}
+
+build_rg_column_groups <- function(specs) {
+  bind_rows(
+    tibble(
+      group = c("model", "overall"),
+      level1 = c("", "Overall"),
+      level2 = c("", "Relative score"),
+      palette = c(NA_character_, "overall")
+    ),
+    specs |>
+      distinct(dataset, task, family, group, palette) |>
+      transmute(
+        group,
+        level1 = family,
+        level2 = dataset,
+        palette
+      )
+  )
+}
+
+column_info <- build_rg_column_info(metric_specs)
+column_groups <- build_rg_column_groups(metric_specs)
+
+row_info <- plot_data |>
+  transmute(id, group = NA_character_)
+
+palettes <- list(
+  overall = c("#F7F7F7", "#8B1A1A"),
+  nlg = c("#F7FBFF", "#6BAED6", "#08519C"),
+  semantic = c("#F7FCF5", "#74C476", "#006D2C"),
+  clinical = c("#FFF7EC", "#FDBB84", "#A63603")
+)
+
+legends <- list(
+  relative_score = list(
+    palette = "overall",
+    geom = "bar",
+    title = "Relative score",
+    labels = c("Low", "High"),
+    size = 1,
+    color = c("#F7F7F7", "#8B1A1A")
+  ),
+  nlg = list(palette = "nlg", enabled = FALSE),
+  semantic = list(palette = "semantic", enabled = FALSE),
+  clinical = list(palette = "clinical", enabled = FALSE)
+)
+
+benchmark_heatmap <- funky_heatmap_bottom_column_names(
+  data = plot_matrix,
+  column_info = column_info,
+  column_groups = column_groups,
+  row_info = row_info,
+  row_groups = NULL,
+  palettes = palettes,
+  legends = legends,
+  scale_column = FALSE,
+  add_abc = FALSE,
+  position_args = position_arguments(
+    row_height = 0.85,
+    row_space = 0.08,
+    row_bigspace = 0.55,
+    col_width = 0.92,
+    col_space = 0.06,
+    col_bigspace = 0.35,
+    col_annot_offset = 2.8,
+    col_annot_angle = 45,
+    expand_ymin = 1.2,
+    expand_xmax = 2.8,
+    expand_ymax = 0.4
+  )
+)
+
+ggsave(
+  file.path(FIG_DIR, "figure-BenchmarkHeatmap.pdf"),
+  plot = benchmark_heatmap,
+  width = 18,
+  height = 5.5,
+  device = "pdf"
+)
+
+benchmark_heatmap
+
+mimic_metric_specs <- metric_specs |>
+  filter(dataset == "MIMIC-CXR")
+
+mimic_plot_matrix <- plot_data |>
+  select(id, all_of(mimic_metric_specs$column_id)) |>
+  mutate(
+    overall = rowMeans(across(all_of(mimic_metric_specs$column_id)), na.rm = TRUE),
+    .after = id
+  )
+
+if (any(!is.finite(mimic_plot_matrix$overall))) {
+  stop("MIMIC-CXR-only overall heatmap scores could not be computed.", call. = FALSE)
+}
+
+mimic_row_info <- mimic_plot_matrix |>
+  transmute(id, group = NA_character_)
+
+mimic_benchmark_heatmap <- funky_heatmap_bottom_column_names(
+  data = mimic_plot_matrix,
+  column_info = build_rg_column_info(mimic_metric_specs),
+  column_groups = build_rg_column_groups(mimic_metric_specs),
+  row_info = mimic_row_info,
+  row_groups = NULL,
+  palettes = palettes,
+  legends = legends,
+  scale_column = FALSE,
+  add_abc = FALSE,
+  position_args = position_arguments(
+    row_height = 0.85,
+    row_space = 0.08,
+    row_bigspace = 0.55,
+    col_width = 0.92,
+    col_space = 0.06,
+    col_bigspace = 0.35,
+    col_annot_offset = 2.8,
+    col_annot_angle = 45,
+    expand_ymin = 1.2,
+    expand_xmax = 2.8,
+    expand_ymax = 0.4
+  )
+)
+
+ggsave(
+  file.path(FIG_DIR, "figure-BenchmarkHeatmap-no-IU-Xray.pdf"),
+  plot = mimic_benchmark_heatmap,
+  width = 11.5,
+  height = 5.5,
+  device = "pdf"
+)
+
+mimic_benchmark_heatmap
+```
+
+# SLAKE VQA Strata Heatmap
+
+```{r vqa-coverage-table}
+vqa_coverage <- vqa_slake_ps |>
+  summarise(
+    models = n_distinct(model_label),
+    examples_per_model = paste(sort(unique(count(vqa_slake_ps, model_label)$n)), collapse = ", "),
+    modalities = n_distinct(modality),
+    organs = n_distinct(location),
+    content_types = n_distinct(content_type)
+  )
+
+vqa_coverage
+```
+
+```{r vqa-strata-heatmap, fig.width=14, fig.height=14.5}
+vqa_column_info <- bind_rows(
+  tibble(
+    id = "model_label",
+    group = "model",
+    name = "Model",
+    geom = "text",
+    palette = NA_character_,
+    width = 4.2,
+    legend = FALSE,
+    hjust = 0
+  ),
+  tibble(
+    id = "overall",
+    group = "overall",
+    name = "Overall",
+    geom = "bar",
+    palette = "overall",
+    width = 2.2,
+    legend = TRUE,
+    hjust = 0
+  ),
+  vqa_strata_long |>
+    distinct(column_id, group, stratum_label, palette, stratum_type, stratum_order) |>
+    arrange(factor(stratum_type, levels = c("modality", "location", "content_type")),
+            stratum_order) |>
+    transmute(
+      id = column_id,
+      group,
+      name = stratum_label,
+      geom = "circle",
+      palette,
+      width = 0.9,
+      legend = FALSE,
+      hjust = NA_real_
+    )
+)
+
+vqa_column_groups <- bind_rows(
+  tibble(
+    group = c("model", "overall"),
+    level1 = c("Model", "Overall"),
+    level2 = c("", "Relative score"),
+    palette = c(NA_character_, "overall")
+  ),
+  vqa_strata_long |>
+    distinct(stratum_type, stratum_type_label, group, palette) |>
+    arrange(factor(stratum_type, levels = c("modality", "location", "content_type"))) |>
+    transmute(
+      group,
+      level1 = stratum_type_label,
+      level2 = "",
+      palette
+    )
+)
+
+vqa_row_info <- vqa_plot_data |>
+  transmute(id, group = row_group)
+
+vqa_row_groups <- vqa_plot_data |>
+  distinct(group = row_group, metric, metric_label) |>
+  arrange(metric) |>
+  transmute(group, level1 = metric_label)
+
+vqa_palettes <- list(
+  overall = c("#FAF5FF", "#7E22CE"),
+  vqa_modality = c("#F5F3FF", "#A78BFA", "#5B21B6"),
+  vqa_location = c("#ECFEFF", "#22D3EE", "#0E7490"),
+  vqa_content_type = c("#FDF2F8", "#F472B6", "#BE185D")
+)
+
+vqa_legends <- list(
+  relative_score = list(
+    palette = "overall",
+    geom = "bar",
+    title = "Relative score",
+    labels = c("Low", "High"),
+    size = 1,
+    color = c("#FAF5FF", "#7E22CE")
+  ),
+  vqa_modality = list(palette = "vqa_modality", enabled = FALSE),
+  vqa_location = list(palette = "vqa_location", enabled = FALSE),
+  vqa_content_type = list(palette = "vqa_content_type", enabled = FALSE)
+)
+
+vqa_strata_heatmap <- funky_heatmap_bottom_column_names(
+  data = vqa_plot_matrix,
+  column_info = vqa_column_info,
+  column_groups = vqa_column_groups,
+  row_info = vqa_row_info,
+  row_groups = vqa_row_groups,
+  palettes = vqa_palettes,
+  legends = vqa_legends,
+  scale_column = FALSE,
+  add_abc = FALSE,
+  position_args = position_arguments(
+    row_height = 0.58,
+    row_space = 0.03,
+    row_bigspace = 0.32,
+    col_width = 0.82,
+    col_space = 0.05,
+    col_bigspace = 0.34,
+    col_annot_offset = 3.1,
+    col_annot_angle = 45,
+    expand_ymin = 0.8,
+    expand_xmax = 3.2,
+    expand_ymax = 0.4
+  )
+)
+
+ggsave(
+  file.path(FIG_DIR, "figure-VQA-StrataHeatmap.pdf"),
+  plot = vqa_strata_heatmap,
+  width = 14,
+  height = 14.5,
+  device = "pdf"
+)
+
+vqa_strata_heatmap
+```
+
+# SLAKE VQA Token F1 Strata Heatmap by Answer Type
+
+```{r vqa-answer-type-strata-heatmap, fig.width=14, fig.height=8.6}
+vqa_answer_type_column_info <- bind_rows(
+  tibble(
+    id = "model_label",
+    group = "model",
+    name = "Model",
+    geom = "text",
+    palette = NA_character_,
+    width = 4.2,
+    legend = FALSE,
+    hjust = 0
+  ),
+  tibble(
+    id = "overall",
+    group = "overall",
+    name = "Overall",
+    geom = "bar",
+    palette = "overall",
+    width = 2.2,
+    legend = TRUE,
+    hjust = 0
+  ),
+  vqa_answer_type_strata_long |>
+    distinct(
+      column_id, group, stratum_label, palette, stratum_type, stratum_order
+    ) |>
+    arrange(
+      factor(stratum_type, levels = c("modality", "location", "content_type")),
+      stratum_order
+    ) |>
+    transmute(
+      id = column_id,
+      group,
+      name = stratum_label,
+      geom = "circle",
+      palette,
+      width = 0.72,
+      legend = FALSE,
+      hjust = NA_real_
+    )
+)
+
+vqa_answer_type_column_groups <- bind_rows(
+  tibble(
+    group = c("model", "overall"),
+    level1 = c("Model", "Overall"),
+    level2 = c("", "Relative score"),
+    palette = c(NA_character_, "overall")
+  ),
+  vqa_answer_type_strata_long |>
+    distinct(stratum_type, stratum_type_label, group, palette) |>
+    arrange(factor(stratum_type, levels = c("modality", "location", "content_type"))) |>
+    transmute(
+      group,
+      level1 = stratum_type_label,
+      level2 = "",
+      palette
+    )
+)
+
+vqa_answer_type_row_info <- vqa_answer_type_plot_data |>
+  transmute(id, group = row_group)
+
+vqa_answer_type_row_groups <- vqa_answer_type_plot_data |>
+  distinct(group = row_group, answer_type, answer_type_label) |>
+  arrange(answer_type) |>
+  transmute(group, level1 = answer_type_label)
+
+vqa_answer_type_strata_heatmap <- funky_heatmap_bottom_column_names(
+  data = vqa_answer_type_plot_matrix,
+  column_info = vqa_answer_type_column_info,
+  column_groups = vqa_answer_type_column_groups,
+  row_info = vqa_answer_type_row_info,
+  row_groups = vqa_answer_type_row_groups,
+  palettes = vqa_palettes,
+  legends = vqa_legends,
+  scale_column = FALSE,
+  add_abc = FALSE,
+  position_args = position_arguments(
+    row_height = 0.66,
+    row_space = 0.04,
+    row_bigspace = 0.55,
+    col_width = 0.82,
+    col_space = 0.05,
+    col_bigspace = 0.34,
+    col_annot_offset = 3.1,
+    col_annot_angle = 45,
+    expand_ymin = 0.8,
+    expand_xmax = 3.2,
+    expand_ymax = 0.4
+  )
+)
+
+ggsave(
+  file.path(FIG_DIR, "figure-VQA-StrataHeatmap-open-closed.pdf"),
+  plot = vqa_answer_type_strata_heatmap,
+  width = 14,
+  height = 8.6,
+  device = "pdf"
+)
+
+vqa_answer_type_strata_heatmap
+```
