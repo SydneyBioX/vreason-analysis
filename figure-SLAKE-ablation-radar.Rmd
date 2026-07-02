@@ -24,13 +24,13 @@ library(tidyverse)
 library(patchwork)
 library(scales)
 
-RESULTS  <- "results"
+RESULTS <- "results"
 SUPP_DIR <- file.path("supp-figures", "ablation-figures")
 dir.create(SUPP_DIR, showWarnings = FALSE, recursive = TRUE)
 
 # Bootstrap parameters used by boot_mean_ci() in figure2-helpers.R.
 N_BOOT <- 10000
-SEED   <- 42
+SEED <- 42
 
 source("./figure2-helpers.R")
 
@@ -57,7 +57,7 @@ load_ablation_per_sample <- function(directory) {
   frames <- map(csvs, function(p) {
     stem <- tools::file_path_sans_ext(basename(p))
     df <- read_csv(p, show_col_types = FALSE)
-    df$model       <- stem
+    df$model <- stem
     df$model_label <- ablation_label(stem)
     df
   })
@@ -66,7 +66,7 @@ load_ablation_per_sample <- function(directory) {
 ```
 
 ```{r helpers}
-HALF_A4_WIDTH_IN  <- 105 / 25.4
+HALF_A4_WIDTH_IN <- 105 / 25.4
 HALF_A4_HEIGHT_IN <- 130 / 25.4
 
 VQA_METRIC_LABELS <- c(
@@ -249,7 +249,7 @@ make_ablation_token_f1_plot <- function(ps_df, title) {
 
 # Larger square canvas for the subcategory radar (content_type + modality +
 # location = up to 21 axes), where the half-A4 portrait size is too cramped.
-SUBCATEGORY_WIDTH_IN  <- 7
+SUBCATEGORY_WIDTH_IN <- 7
 SUBCATEGORY_HEIGHT_IN <- 7
 
 save_half_a4_pdf <- function(plot, filename) {
@@ -374,7 +374,7 @@ subcategory_plots <- crossing(
 ) |>
   pmap(function(metric, slice) {
     slice_spec <- answer_type_slices[[slice]]
-    sub_ps     <- slice_spec$filter(abl_vqa_slake_ps)
+    sub_ps <- slice_spec$filter(abl_vqa_slake_ps)
 
     p <- make_ablation_metric_plot(
       sub_ps,
@@ -519,7 +519,7 @@ bar_with_ci_by_stratum <- function(boot_df, metric_name, title,
   if (nrow(plot_df) == 0) return(ggplot() + theme_void())
 
   models <- levels(plot_df$model_label)
-  cols   <- get_model_colours(models)
+  cols <- get_model_colours(models)
   if (is.null(y_label)) y_label <- metric_label(metric_name)
 
   ggplot(plot_df,
@@ -562,9 +562,9 @@ ablation_strata_bar_plots <- crossing(
   slice   = names(answer_type_slices)
 ) |>
   pmap(function(stratum, metric, slice) {
-    spec       <- STRATA_BAR_SPECS[[stratum]]
+    spec <- STRATA_BAR_SPECS[[stratum]]
     slice_spec <- answer_type_slices[[slice]]
-    sub_ps     <- slice_spec$filter(abl_vqa_slake_ps)
+    sub_ps <- slice_spec$filter(abl_vqa_slake_ps)
 
     boot_df <- compute_strata_boot_cis(
       sub_ps, ablation_metrics, spec$col, spec$levels, pretty = spec$pretty

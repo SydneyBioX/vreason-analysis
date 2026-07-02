@@ -29,7 +29,7 @@ FIG_DIR <- "main-figures"
 dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
 
 N_BOOT <- 10000
-SEED   <- 42
+SEED <- 42
 
 source("./figure2-helpers.R")
 
@@ -156,7 +156,7 @@ funky_heatmap_bottom_column_names <- function(
 ```{r metric-specs}
 RG_NLG_METRICS <- c("bleu1", "bleu2", "bleu4", "meteor", "rougel", "cider")
 RG_SEM_METRICS <- c("bertscore", "semb_score", "radgraph_combined")
-RG_CE_METRICS  <- c("CE_precision",  "CE_recall",  "CE_f1",
+RG_CE_METRICS <- c("CE_precision",  "CE_recall",  "CE_f1",
                     "CE5_precision", "CE5_recall", "CE5_f1")
 VQA_METRICS <- c("exact_match", "contains_match", "token_recall", "token_f1")
 

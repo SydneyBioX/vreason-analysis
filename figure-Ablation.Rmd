@@ -28,7 +28,7 @@ library(ggpubr)
 RESULTS <- "results"
 
 # Main-text figure: composite ablation panel.
-FIG_DIR  <- "main-figures"
+FIG_DIR <- "main-figures"
 # Supplementary: per-metric ablation bar+CI panels.
 SUPP_DIR <- file.path("supp-figures", "ablation-figures")
 
@@ -36,7 +36,7 @@ walk(c(FIG_DIR, SUPP_DIR),
      ~ dir.create(.x, showWarnings = FALSE, recursive = TRUE))
 
 N_BOOT <- 10000
-SEED   <- 42
+SEED <- 42
 
 source("./figure2-helpers.R")
 ```
@@ -73,7 +73,7 @@ load_ablation_per_sample <- function(directory) {
   frames <- map(csvs, function(p) {
     stem <- tools::file_path_sans_ext(basename(p))
     df <- read_csv(p, show_col_types = FALSE)
-    df$model       <- stem
+    df$model <- stem
     df$model_label <- ablation_label(stem)
     df
   })
@@ -93,15 +93,15 @@ ABL_RG_BAR_METRICS <- c("bleu4", "meteor", "rougel",
                         "bertscore", "semb_score", "radgraph_combined")
 VQA_METRICS <- c("exact_match", "contains_match", "token_recall", "token_f1")
 
-abl_mimic_ps      <- load_ablation_per_sample(file.path(RESULTS, "ablation/rg/mimic_cxr"))
+abl_mimic_ps <- load_ablation_per_sample(file.path(RESULTS, "ablation/rg/mimic_cxr"))
 abl_mimic_summary <- build_summary(abl_mimic_ps, RG_RADAR_METRICS)
-abl_mimic_boot    <- compute_boot_cis(abl_mimic_ps, ABL_RG_BAR_METRICS)
+abl_mimic_boot <- compute_boot_cis(abl_mimic_ps, ABL_RG_BAR_METRICS)
 
-abl_iu_ps      <- load_ablation_per_sample(file.path(RESULTS, "ablation/rg/iu_xray"))
+abl_iu_ps <- load_ablation_per_sample(file.path(RESULTS, "ablation/rg/iu_xray"))
 abl_iu_summary <- build_summary(abl_iu_ps, RG_RADAR_METRICS)
-abl_iu_boot    <- compute_boot_cis(abl_iu_ps, ABL_RG_BAR_METRICS)
+abl_iu_boot <- compute_boot_cis(abl_iu_ps, ABL_RG_BAR_METRICS)
 
-abl_vqa_ps   <- load_ablation_per_sample(file.path(RESULTS, "ablation/vqa/slake"))
+abl_vqa_ps <- load_ablation_per_sample(file.path(RESULTS, "ablation/vqa/slake"))
 abl_vqa_boot <- compute_boot_cis(abl_vqa_ps, VQA_METRICS)
 ```
 

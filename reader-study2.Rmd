@@ -426,7 +426,7 @@ c1 <- man |> group_by(bin) |>
          hi = purrr::map2_dbl(caught, gt, ~ wilson(.x, .y)[2]),
          arm = factor(arm, levels = c("H", "HAI"),
                       labels = c("Unaided reader", "Reader + VReason")))
-ov_h   <- 100 * sum(man$caught_h)   / sum(man$npath)
+ov_h <- 100 * sum(man$caught_h)   / sum(man$npath)
 ov_hai <- 100 * sum(man$caught_hai) / sum(man$npath)
 
 p_c1 <- ggplot(c1, aes(bin, recall, fill = arm)) +

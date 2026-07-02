@@ -29,7 +29,7 @@ FIG_DIR <- "main-figures"
 dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
 
 N_BOOT <- 10000
-SEED   <- 42
+SEED <- 42
 
 source("./figure2-helpers.R")
 ```
