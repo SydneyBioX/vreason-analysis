@@ -161,9 +161,6 @@ p_participant_row <- ggarrange(
   align = "h", legend = "bottom"
 )
 p_participant_row
-
-ggsave("./figures/reader-study/participant_row_A4.pdf", p_participant_row,
-  width = 8.27, height = 4, device = "pdf", bg = "white")
 ```
 
 ## Reasons for rejecting VReason.
@@ -267,9 +264,6 @@ p_decision_sankey <- ggplot(sankey_flow,
   theme(legend.position = "bottom", panel.grid.major.x = element_blank(), panel.grid.minor = element_blank())
 
 p_decision_sankey
-
-# ggsave("./figures/reader-study/decision_confidence_sankey.pdf", 
-#        p_decision_sankey, width = 8.2, height = 4, device = "pdf")
 ```
 
 ```{r}
@@ -358,9 +352,6 @@ p_condition_level <- ggplot(condition_counts_long,
   coord_flip() 
 
 p_condition_level
-
-# ggsave("./figures/reader-study/condition_missed_recovered.pdf", p_condition_level,
-  # width = 4.13, height = 4, device = "pdf", bg = "white")
 ```
 
 

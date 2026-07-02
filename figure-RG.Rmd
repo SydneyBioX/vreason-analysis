@@ -1,0 +1,224 @@
+---
+title: "figure-RG"
+author: "Harry Robertson"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 14,
+  fig.height = 7,
+  dpi = 600
+)
+
+library(tidyverse)
+library(patchwork)
+library(scales)
+library(ggpubr)
+
+RESULTS <- "results"
+
+# Main-text figure: composite radar panel (this Rmd's headline output).
+FIG_DIR <- "main-figures"
+# Supplementary figures: per-metric bar+CI panels go to dataset-specific dirs.
+SUPP_MIMIC_DIR <- file.path("supp-figures", "MIMIC-CXR-figures")
+SUPP_IU_DIR    <- file.path("supp-figures", "IU-xray-figures")
+
+walk(c(FIG_DIR, SUPP_MIMIC_DIR, SUPP_IU_DIR),
+     ~ dir.create(.x, showWarnings = FALSE, recursive = TRUE))
+
+N_BOOT <- 10000
+SEED   <- 42
+
+source("./figure2-helpers.R")
+```
+
+```{r data}
+RG_NLG_METRICS <- c("bleu1", "bleu2", "bleu4", "meteor", "rougel", "cider")
+RG_SEM_METRICS <- c("bertscore", "semb_score", "radgraph_combined")
+RG_CE_METRICS  <- c("CE_precision",  "CE_recall",  "CE_f1",
+                    "CE5_precision", "CE5_recall", "CE5_f1")
+RG_RADAR_METRICS <- c(RG_NLG_METRICS, RG_SEM_METRICS, RG_CE_METRICS)
+
+rg_mimic_ps      <- load_per_sample(file.path(RESULTS, "performance/rg/mimic_cxr"))
+rg_mimic_summary <- build_summary(rg_mimic_ps, RG_RADAR_METRICS)
+rg_mimic_boot    <- compute_boot_cis(rg_mimic_ps, RG_RADAR_METRICS)
+
+rg_iu_ps      <- load_per_sample(file.path(RESULTS, "performance/rg/iu_xray"))
+rg_iu_summary <- build_summary(rg_iu_ps, RG_RADAR_METRICS)
+rg_iu_boot    <- compute_boot_cis(rg_iu_ps, RG_RADAR_METRICS)
+```
+
+# Main figure — RG radars (MIMIC-CXR + IU X-ray)
+
+```{r figure-RG-main, fig.width=14, fig.height=7}
+p_mimic <- radar_plot(
+  rg_mimic_summary,
+  RG_RADAR_METRICS,
+  title = "MIMIC-CXR",
+  axis_limits = MIMIC_CXR_RADAR_LIMITS,
+  label_size = 2.6,
+  grid_label_size = 2.1
+)
+p_iu    <- radar_plot(rg_iu_summary,    RG_RADAR_METRICS, title = "IU X-ray")
+
+figure_rg <- (p_mimic + p_iu) +
+  plot_layout(ncol = 2, guides = "collect") +
+  plot_annotation(tag_levels = "A") &
+  theme(
+    legend.position = "bottom",
+    plot.tag        = element_text(face = "bold", size = 14)
+  )
+
+ggsave(file.path(FIG_DIR, "figure-RG.pdf"),
+       plot = figure_rg, width = 14, height = 7, device = "pdf")
+
+figure_rg
+```
+
+# Supplementary panels
+
+Each per-metric bar + 95% bootstrap CI is saved individually to
+`supp-figures/{MIMIC-CXR,IU-xray}-figures/`, plus a 3-row arranged composite
+per metric family.
+
+```{r supp-helpers}
+save_supp_panels <- function(boot_df, metric_specs, supp_dir,
+                             y_limits = c(0, 1)) {
+  imap(metric_specs, function(metric, figure_name) {
+    p <- bar_with_ci(boot_df, metric) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    if (!is.null(y_limits)) {
+      p <- p + scale_y_continuous(limits = y_limits,
+                                  breaks = seq(y_limits[1], y_limits[2], 0.2))
+    }
+    ggsave(file.path(supp_dir, paste0(figure_name, ".pdf")),
+           plot = p, width = 5, height = 4, device = "pdf")
+    p
+  })
+}
+
+save_supp_arranged <- function(plots, filename, supp_dir,
+                               ncol, nrow, width, height,
+                               legend = "bottom") {
+  arr <- ggarrange(plotlist = plots, ncol = ncol, nrow = nrow,
+                   common.legend = TRUE, legend = legend)
+  ggsave(file.path(supp_dir, filename),
+         plot = arr, width = width, height = height, device = "pdf")
+  arr
+}
+```
+
+## MIMIC-CXR — NLG metrics (a–f)
+
+```{r supp-mimic-nlg}
+mimic_nlg_specs <- c(
+  figure2a_bleu1  = "bleu1",
+  figure2b_bleu2  = "bleu2",
+  figure2c_bleu4  = "bleu4",
+  figure2d_meteor = "meteor",
+  figure2e_rougel = "rougel",
+  figure2f_cider  = "cider"
+)
+mimic_nlg_plots <- save_supp_panels(rg_mimic_boot, mimic_nlg_specs,
+                                    SUPP_MIMIC_DIR, y_limits = NULL)
+save_supp_arranged(mimic_nlg_plots, "figure2a-f.pdf", SUPP_MIMIC_DIR,
+                   ncol = 3, nrow = 2, width = 9, height = 7)
+```
+
+## MIMIC-CXR — Semantic metrics (g–i)
+
+```{r supp-mimic-sem}
+mimic_sem_specs <- c(
+  figure2g_bert     = "bertscore",
+  figure2h_semb     = "semb_score",
+  figure2i_radgraph = "radgraph_combined"
+)
+mimic_sem_plots <- save_supp_panels(rg_mimic_boot, mimic_sem_specs, SUPP_MIMIC_DIR)
+save_supp_arranged(mimic_sem_plots, "figure2g-h.pdf", SUPP_MIMIC_DIR,
+                   ncol = 3, nrow = 1, width = 9, height = 3.5, legend = "none")
+```
+
+## MIMIC-CXR — Clinical efficacy (j–o)
+
+```{r supp-mimic-ce}
+mimic_ce_specs <- c(
+  figure2j_ce_precision  = "CE_precision",
+  figure2k_ce_recall     = "CE_recall",
+  figure2l_ce_f1         = "CE_f1",
+  figure2m_ce5_precision = "CE5_precision",
+  figure2n_ce5_recall    = "CE5_recall",
+  figure2o_ce5_f1        = "CE5_f1"
+)
+mimic_ce_plots <- save_supp_panels(rg_mimic_boot, mimic_ce_specs, SUPP_MIMIC_DIR)
+save_supp_arranged(mimic_ce_plots, "figure2j-o.pdf", SUPP_MIMIC_DIR,
+                   ncol = 3, nrow = 2, width = 9, height = 7)
+```
+
+## MIMIC-CXR — Selected 3x3 composite (a-h, o)
+
+```{r supp-mimic-selected-3x3}
+mimic_selected_plots <- c(
+  mimic_nlg_plots,
+  mimic_sem_plots[c("figure2g_bert", "figure2h_semb")],
+  mimic_ce_plots["figure2o_ce5_f1"]
+)
+
+save_supp_arranged(mimic_selected_plots, "figure2a-h_o.pdf", SUPP_MIMIC_DIR,
+                   ncol = 3, nrow = 3, width = 9, height = 9)
+```
+
+## IU X-ray — NLG metrics (a–f)
+
+```{r supp-iu-nlg}
+iu_nlg_specs <- c(
+  figure3a_bleu1  = "bleu1",
+  figure3b_bleu2  = "bleu2",
+  figure3c_bleu4  = "bleu4",
+  figure3d_meteor = "meteor",
+  figure3e_rougel = "rougel",
+  figure3f_cider  = "cider"
+)
+iu_nlg_plots <- save_supp_panels(rg_iu_boot, iu_nlg_specs,
+                                 SUPP_IU_DIR, y_limits = NULL)
+save_supp_arranged(iu_nlg_plots, "figure3a-f.pdf", SUPP_IU_DIR,
+                   ncol = 3, nrow = 2, width = 9, height = 7)
+```
+
+## IU X-ray — Semantic metrics (g–i)
+
+```{r supp-iu-sem}
+iu_sem_specs <- c(
+  figure3g_bert     = "bertscore",
+  figure3h_semb     = "semb_score",
+  figure3i_radgraph = "radgraph_combined"
+)
+iu_sem_plots <- save_supp_panels(rg_iu_boot, iu_sem_specs, SUPP_IU_DIR)
+save_supp_arranged(iu_sem_plots, "figure3g-i.pdf", SUPP_IU_DIR,
+                   ncol = 3, nrow = 1, width = 9, height = 3.5, legend = "none")
+```
+
+## IU X-ray — Clinical efficacy (j–o)
+
+```{r supp-iu-ce}
+iu_ce_specs <- c(
+  figure3j_ce_precision  = "CE_precision",
+  figure3k_ce_recall     = "CE_recall",
+  figure3l_ce_f1         = "CE_f1",
+  figure3m_ce5_precision = "CE5_precision",
+  figure3n_ce5_recall    = "CE5_recall",
+  figure3o_ce5_f1        = "CE5_f1"
+)
+iu_ce_plots <- save_supp_panels(rg_iu_boot, iu_ce_specs, SUPP_IU_DIR)
+save_supp_arranged(iu_ce_plots, "figure3j-o.pdf", SUPP_IU_DIR,
+                   ncol = 3, nrow = 2, width = 9, height = 7)
+```

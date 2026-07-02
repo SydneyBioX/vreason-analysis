@@ -1,0 +1,262 @@
+---
+title: "VReason reader study — finding retrieval vs rarity of a finding"
+author: "Harry Robertson"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 6.5, fig.height = 4.2, dpi = 300)
+```
+
+```{r libs}
+library(tidyverse)
+library(lme4)
+library(scales)
+
+# ---- helpers (shared with reader-study-novel-findings.Rmd) -------------------
+splitc <- function(x) {
+  str_split(replace_na(as.character(x), ""), ";") |> unlist(use.names = FALSE) |>
+    str_trim() |> (\(v) v[v != ""])()
+}
+# TRUE pathology burden (audit 2026-06-22, see reader-study-analysis/verification/). Exclude both
+# "No Finding" (a token, not a pathology) and "Support Devices" (a device, not a retrievable
+# pathology — also under-labeled in raw GT, and counting it leaked the normal case cb103846 into
+# this analysis as a spurious very-rare "finding"). `pset()` is the pathology label SET per
+# response; `npath()` its size.
+NONPATH <- c("No Finding", "Support Devices")
+pset  <- function(x) str_split(replace_na(as.character(x), ""), ";") |>
+  map(~ setdiff(str_trim(.x[.x != ""]), NONPATH))
+npath <- function(x) lengths(pset(x))
+wilson <- function(k, n, z = 1.96) {                 # returns c(lo, hi) as proportion
+  if (is.na(n) || n == 0) return(c(NA, NA))
+  p <- k / n; d <- 1 + z^2/n
+  c((p + z^2/(2*n))/d - z*sqrt(p*(1-p)/n + z^2/(4*n^2))/d,
+    (p + z^2/(2*n))/d + z*sqrt(p*(1-p)/n + z^2/(4*n^2))/d)
+}
+P <- function(x) signif(x, 3)
+
+COL_VR    <- "#8B1A1A"   # VReason red (reader + VReason)
+COL_NEU   <- "#9CA3AF"   # neutral grey (unaided reader)
+COL_AMBER <- "#E69F00"
+COL_GREEN <- "#009E73"
+COL_BLUE  <- "#0072B2"
+theme_set(theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold", size = rel(1.02)),
+        plot.subtitle = element_text(colour = "grey35", size = rel(0.85)),
+        legend.position = "bottom", legend.title = element_blank()))
+```
+
+A finding's **rarity** is its surprisal `-log(prevalence)` across the case set. The reader-study
+question is whether *readers* miss rarer findings more, and whether **VReason recovers those rare
+misses**. Working at the finding level in the **manual arm**: every ground-truth condition in every
+reader×case response is one retrieval opportunity, scored as missed (unaided) and, if missed, as
+recovered after VReason. The number of opportunities per condition is uneven (rare findings appear
+in few cases), so inference comes from **GLMMs with `(1|user_id)+(1|case_id)`** and the descriptive
+points carry Wilson intervals.
+
+```{r data}
+DL  <- "~/Downloads"
+det <- read_csv(file.path(DL, "per_response_detailed.csv"), show_col_types = FALSE)
+
+# Corrected case-level ground truth (audit 2026-06-22): drops 3 phantom "Enlarged
+# Cardiomediastinum" labels (reports describe a normal mediastinum) and records omitted Support
+# Devices. Keyed on full case_id; unmatched cases from a re-export fall back to raw via coalesce().
+gtkey <- read_csv("reader-study-analysis/verification/gt_conditions_corrected.csv",
+                  show_col_types = FALSE) |>
+  select(case_id, gt_conditions_corrected)
+det <- det |>
+  left_join(gtkey, by = "case_id") |>
+  mutate(gt_use = coalesce(gt_conditions_corrected, gt_conditions))
+
+# prevalence / surprisal of each condition across ALL cases (pathology labels only)
+Ncase <- n_distinct(det$case_id)
+freq <- det |>
+  transmute(case_id, cond = pset(gt_use)) |>
+  unnest_longer(cond) |>
+  distinct(case_id, cond) |>
+  count(cond, name = "ncase") |>
+  mutate(surprisal = -log(ncase / Ncase))
+
+# manual-arm abnormal responses. Miss/recovery are recomputed from the corrected pathology sets
+# (verified label-level: missed = gt-human, recovered = (gt-human) intersect humanai, 0/176
+# mismatches), so the GT fix propagates; the burden guard is then satisfied by construction.
+man <- det |>
+  mutate(npath = npath(gt_use),
+         missed_by_human = lengths(map2(pset(gt_use), pset(human_conditions), setdiff))) |>
+  filter(presentation_mode_raw == "manual", npath > 0, missed_by_human <= npath)
+
+# one row per (reader x case x ground-truth finding): was it missed? recovered by VReason?
+cond_obs <- man |>
+  transmute(case_id, user_id,
+            cond = pset(gt_use),
+            hum  = pset(human_conditions),
+            hai  = pset(humanai_conditions)) |>
+  unnest_longer(cond) |>
+  mutate(was_missed   = !purrr::map2_lgl(cond, hum, ~ .x %in% .y),
+         was_recov    = was_missed & purrr::map2_lgl(cond, hai, ~ .x %in% .y),
+         still_missed = was_missed & !was_recov) |>
+  left_join(freq, by = "cond")
+
+# per-condition retrieval rates + Wilson intervals
+ct <- cond_obs |> group_by(cond) |>
+  summarise(n_obs = n(), n_missed = sum(was_missed), n_recovered = sum(was_recov & was_missed),
+            surprisal = first(surprisal), ncase = first(ncase), .groups = "drop") |>
+  mutate(h_caught   = n_obs - n_missed,
+         hai_caught = n_obs - n_missed + n_recovered,
+         human_recall   = h_caught / n_obs,
+         humanai_recall = hai_caught / n_obs,
+         recovery_rate  = ifelse(n_missed > 0, n_recovered / n_missed, NA_real_),
+         h_lo   = purrr::map2_dbl(h_caught,   n_obs, ~ wilson(.x, .y)[1]),
+         h_hi   = purrr::map2_dbl(h_caught,   n_obs, ~ wilson(.x, .y)[2]),
+         hai_lo = purrr::map2_dbl(hai_caught, n_obs, ~ wilson(.x, .y)[1]),
+         hai_hi = purrr::map2_dbl(hai_caught, n_obs, ~ wilson(.x, .y)[2])) |>
+  arrange(surprisal)
+```
+
+```{r}
+pneumonia_case_ids = cond_obs %>% filter(cond == "Pneumonia") %>% pull(case_id) %>% unique()
+
+reviews <- read_csv(file.path("~/Downloads/finding_reviews_rows.csv"))
+pneumonia_reviews = reviews %>% filter(case_id %in% pneumonia_case_ids)
+```
+
+
+---
+
+## R1 — Readers miss rarer findings (headline)
+
+Each point is a condition: unaided reader recall against rarity, sized by the number of retrieval
+opportunities, with Wilson intervals. The GLMM tests the rarity→miss effect across the
+finding-level observations, accounting for repeated readers and cases.
+
+```{r R1, fig.height=4.6}
+m_r1   <- glmer(was_missed ~ scale(surprisal) + (1|user_id) + (1|case_id),
+                data = cond_obs, family = binomial, control = glmerControl(optimizer = "bobyqa"))
+or_r1  <- exp(fixef(m_r1)["scale(surprisal)"]); p_r1v <- summary(m_r1)$coefficients["scale(surprisal)", 4]
+rho1   <- cor(ct$surprisal, ct$human_recall, method = "spearman")
+
+p_r1 <- ggplot(ct, aes(surprisal, human_recall)) +
+  geom_smooth(method = "lm", colour = COL_NEU, fill = COL_NEU, alpha = 0.12) +
+  geom_errorbar(aes(ymin = h_lo, ymax = h_hi), width = 0.04, colour = COL_NEU) +
+  geom_point(aes(size = n_obs), colour = COL_NEU, alpha = 0.9) +
+  geom_text(aes(label = cond), vjust = -0.9, size = 2.7, colour = "grey25") +
+  scale_size_continuous(range = c(2, 6), name = "retrieval opportunities") +
+  scale_y_continuous(labels = label_percent(), limits = c(-0.05, 1.15)) +
+  labs(title = "R1: Unaided readers miss rarer findings",
+       subtitle = sprintf("GLMM miss OR = %.2f per +1 SD rarity (p = %.3f); Spearman rho(recall) = %.2f",
+                          or_r1, p_r1v, rho1),
+       x = "Finding rarity  (surprisal = -log prevalence)", y = "Unaided reader recall")
+p_r1
+```
+
+---
+
+## R2 — The rarity gradient persists after VReason
+
+The same recall against rarity, now overlaying unaided (grey) and reader+VReason (red). If VReason
+preferentially rescued rare misses, the red slope would be flatter than the grey one — but the two
+slopes are essentially parallel: VReason lifts recall roughly uniformly across rarity rather than
+closing the gap at the rare end.
+
+```{r R2, fig.height=4.6}
+m_r2  <- glmer(still_missed ~ scale(surprisal) + (1|user_id) + (1|case_id),
+               data = cond_obs, family = binomial, control = glmerControl(optimizer = "bobyqa"))
+or_r2 <- exp(fixef(m_r2)["scale(surprisal)"])
+rho2  <- cor(ct$surprisal, ct$humanai_recall, method = "spearman")
+
+r2 <- ct |> select(cond, surprisal, n_obs, h_lo, h_hi, hai_lo, hai_hi,
+                   Unaided = human_recall, `Reader + VReason` = humanai_recall) |>
+  pivot_longer(c(Unaided, `Reader + VReason`), names_to = "arm", values_to = "recall") |>
+  mutate(arm = factor(arm, levels = c("Unaided", "Reader + VReason")))
+
+p_r2 <- ggplot(r2, aes(surprisal, recall, colour = arm, fill = arm)) +
+  geom_smooth(method = "lm", alpha = 0.1) +
+  geom_point(aes(size = n_obs), alpha = 0.85) +
+  scale_colour_manual(values = c("Unaided" = COL_NEU, "Reader + VReason" = COL_VR), aesthetics = c("colour", "fill")) +
+  scale_size_continuous(range = c(2, 6), guide = "none") +
+  scale_y_continuous(labels = label_percent(), limits = c(-0.05, 1.1)) +
+  labs(title = "R2: VReason does not flatten the rarity gradient",
+       subtitle = sprintf("Rarity gradient essentially unchanged after VReason: still-missed OR = %.2f vs unaided %.2f per +1 SD rarity (rho %.2f vs %.2f)",
+                          or_r2, or_r1, rho1, rho2),
+       x = "Finding rarity  (surprisal = -log prevalence)", y = "Recall")
+p_r2
+```
+
+---
+
+## R3 — VReason recovery rate vs rarity
+
+Of the findings readers missed unaided, the fraction VReason helped recover, by condition rarity.
+Restricted to conditions that were missed at least once; point area is the number missed, bars are
+Wilson intervals.
+
+```{r R3}
+r3 <- ct |> filter(n_missed > 0) |>
+  mutate(rr_lo = purrr::map2_dbl(n_recovered, n_missed, ~ wilson(.x, .y)[1]),
+         rr_hi = purrr::map2_dbl(n_recovered, n_missed, ~ wilson(.x, .y)[2]))
+rho3 <- cor(r3$surprisal, r3$recovery_rate, method = "spearman")
+
+p_r3 <- ggplot(r3, aes(surprisal, recovery_rate)) +
+  geom_smooth(method = "lm", colour = COL_VR, fill = COL_VR, alpha = 0.12) +
+  geom_errorbar(aes(ymin = rr_lo, ymax = rr_hi), width = 0.04, colour = COL_NEU) +
+  geom_point(aes(size = n_missed), colour = COL_VR, alpha = 0.85) +
+  geom_text(aes(label = cond), vjust = -0.9, size = 2.7, colour = "grey25") +
+  scale_size_continuous(range = c(2, 6), name = "findings missed") +
+  scale_y_continuous(labels = label_percent(), limits = c(-0.05, 1.18)) +
+  labs(title = "R3: VReason recovery of missed findings vs rarity",
+       subtitle = sprintf("Spearman rho = %.2f; rarest findings rest on 1-4 misses each (Wilson intervals)", rho3),
+       x = "Finding rarity  (surprisal = -log prevalence)", y = "Share of unaided misses recovered")
+p_r3
+```
+
+---
+
+## R4 — Unaided → VReason-assisted recall, by condition
+
+Per-condition dumbbells from unaided (grey) to reader+VReason (red), ordered rarest at top. The
+segment length is the retrieval gain VReason delivers for each finding type.
+
+```{r R4}
+r4 <- ct |> mutate(cond = fct_reorder(cond, surprisal))
+
+p_r4 <- ggplot(r4) +
+  geom_segment(aes(y = cond, yend = cond, x = human_recall, xend = humanai_recall),
+               colour = "grey70", linewidth = 1.1) +
+  geom_point(aes(human_recall, cond, colour = "Unaided"), size = 3) +
+  geom_point(aes(humanai_recall, cond, colour = "Reader + VReason"), size = 3) +
+  geom_text(aes(humanai_recall, cond, label = sprintf("n=%d", n_obs)), hjust = -0.4, size = 2.6, colour = "grey35") +
+  scale_colour_manual(values = c("Unaided" = COL_NEU, "Reader + VReason" = COL_VR)) +
+  scale_x_continuous(labels = label_percent(), limits = c(0, 1.12)) +
+  labs(x = "Finding recall", y = NULL)
+
+ggsave("./figures/reader-study/rarity_R4.pdf", p_r4, width = 6.5, height = 4.2, device = "pdf")
+```
+
+---
+
+> **Scope & caveats.** Manual arm only; finding-level observations from `r nrow(man)` responses on
+> `r n_distinct(man$case_id)` abnormal cases. Opportunities per condition are very uneven (3–61) and
+> the rarest findings rest on a handful of misses, so per-condition rates are uncertain (Wilson
+> intervals) and the GLMMs — not the points — carry the inference. Rarity tracks finding count and
+> difficulty, so this is the rarity axis of the reader study, not a rarity effect isolated from them.
+> Recovery is observed only in the manual arm (`recovered_conditions` is empty by design in
+> ai_assisted). Ground truth uses the corrected case-level key
+> (`reader-study-analysis/verification/gt_conditions_corrected.csv`): "No Finding" and "Support
+> Devices" are excluded from the finding set (the latter previously entered the rarity axis as a
+> spurious ncase=1 condition), 3 phantom "Enlarged Cardiomediastinum" labels are dropped, and
+> miss/recovery are recomputed from the corrected pathology sets.
+
+```{r save, include=FALSE}
+dir.create("./figures/reader-study", showWarnings = FALSE, recursive = TRUE)
+walk2(list(p_r1, p_r2, p_r3, p_r4),
+      paste0("./figures/reader-study/rarity_R", 1:4, ".pdf"),
+      ~ ggsave(.y, plot = .x, width = 6.5, height = 4.2, device = "pdf", bg = "white"))
+```

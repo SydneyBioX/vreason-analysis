@@ -24,9 +24,7 @@ library(tidyverse)
 library(patchwork)
 library(scales)
 
-RESULTS <- "results"
-SUPP_DIR <- file.path("supp-figures", "ablation-figures")
-dir.create(SUPP_DIR, showWarnings = FALSE, recursive = TRUE)
+RESULTS  <- "results"
 
 # Bootstrap parameters used by boot_mean_ci() in figure2-helpers.R.
 N_BOOT <- 10000
@@ -66,9 +64,6 @@ load_ablation_per_sample <- function(directory) {
 ```
 
 ```{r helpers}
-HALF_A4_WIDTH_IN <- 105 / 25.4
-HALF_A4_HEIGHT_IN <- 130 / 25.4
-
 VQA_METRIC_LABELS <- c(
   token_f1       = "Token F1",
   exact_match    = "Exact match",
@@ -247,35 +242,6 @@ make_ablation_token_f1_plot <- function(ps_df, title) {
   make_ablation_metric_plot(ps_df, "token_f1", title)
 }
 
-# Larger square canvas for the subcategory radar (content_type + modality +
-# location = up to 21 axes), where the half-A4 portrait size is too cramped.
-SUBCATEGORY_WIDTH_IN <- 7
-SUBCATEGORY_HEIGHT_IN <- 7
-
-save_half_a4_pdf <- function(plot, filename) {
-  ggsave(
-    filename = file.path(SUPP_DIR, paste0(filename, ".pdf")),
-    plot = plot,
-    width = HALF_A4_WIDTH_IN,
-    height = HALF_A4_HEIGHT_IN,
-    device = "pdf",
-    bg = "white"
-  )
-}
-
-save_square_pdf <- function(plot, filename,
-                            width = SUBCATEGORY_WIDTH_IN,
-                            height = SUBCATEGORY_HEIGHT_IN) {
-  ggsave(
-    filename = file.path(SUPP_DIR, paste0(filename, ".pdf")),
-    plot = plot,
-    width = width,
-    height = height,
-    device = "pdf",
-    bg = "white"
-  )
-}
-
 ```
 
 ```{r data}
@@ -296,22 +262,11 @@ ablation_metrics <- c("token_f1", "exact_match", "contains_match", "token_recall
 slake_ablation_metric_plots <- ablation_metrics |>
   set_names() |>
   map(\(metric) {
-    p <- make_ablation_metric_plot(
+    make_ablation_metric_plot(
       abl_vqa_slake_ps,
       metric,
       paste0("SLAKE ablation ", metric_label(metric), " - all questions")
     )
-
-    save_half_a4_pdf(
-      p,
-      paste0(
-        "figure-SLAKE-ablation-",
-        metric_filename(metric),
-        "-all-comparisons"
-      )
-    )
-
-    p
   })
 
 slake_ablation_token_f1_all <- slake_ablation_metric_plots[["token_f1"]]
@@ -331,22 +286,12 @@ answer_type_metric_plots <- crossing(
   pmap(function(metric, answer_type_level) {
     sub_ps <- abl_vqa_slake_ps |> filter(answer_type == answer_type_level)
 
-    p <- make_ablation_metric_plot(
+    make_ablation_metric_plot(
       sub_ps,
       metric,
       paste0("SLAKE ablation ", metric_label(metric),
              " - ", answer_type_level, " questions")
     )
-
-    save_half_a4_pdf(
-      p,
-      paste0(
-        "figure-SLAKE-ablation-", metric_filename(metric),
-        "-all-comparisons-", safe_filename(answer_type_level)
-      )
-    )
-
-    p
   })
 
 walk(answer_type_metric_plots, print)
@@ -376,7 +321,7 @@ subcategory_plots <- crossing(
     slice_spec <- answer_type_slices[[slice]]
     sub_ps <- slice_spec$filter(abl_vqa_slake_ps)
 
-    p <- make_ablation_metric_plot(
+    make_ablation_metric_plot(
       sub_ps,
       metric,
       paste0("SLAKE subcategory ", metric_label(metric),
@@ -390,16 +335,6 @@ subcategory_plots <- crossing(
       coord_ylim      = c(-1.4, 1.4),
       plot_margin     = margin(6, 18, 6, 18)
     )
-
-    save_square_pdf(
-      p,
-      paste0(
-        "figure-SLAKE-ablation-subcategory-",
-        metric_filename(metric), "-", safe_filename(slice)
-      )
-    )
-
-    p
   })
 
 walk(subcategory_plots, print)
@@ -444,16 +379,8 @@ make_modality_findings_radar <- function(ps_df, modality_level, metric,
 modality_findings_radars <- MODALITY_LEVELS |>
   set_names() |>
   map(\(mod) {
-    p <- make_modality_findings_radar(abl_vqa_slake_ps, mod,
-                                      modality_radar_metric)
-    save_square_pdf(
-      p,
-      paste0("figure-SLAKE-ablation-content-type-region-",
-             metric_filename(modality_radar_metric),
-             "-modality-", safe_filename(mod)),
-      width = 4.5, height = 5
-    )
-    p
+    make_modality_findings_radar(abl_vqa_slake_ps, mod,
+                                 modality_radar_metric)
   })
 
 modality_findings_panel <- wrap_plots(modality_findings_radars, ncol = 3,
@@ -465,13 +392,6 @@ modality_findings_panel <- wrap_plots(modality_findings_radars, ncol = 3,
                                             hjust = 0.5))
   ) &
   theme(legend.position = "bottom")
-
-save_square_pdf(
-  modality_findings_panel,
-  paste0("figure-SLAKE-ablation-content-type-region-",
-         metric_filename(modality_radar_metric), "-by-modality-panel"),
-  width = 13.5, height = 5.5
-)
 
 modality_findings_panel
 ```
@@ -570,23 +490,11 @@ ablation_strata_bar_plots <- crossing(
       sub_ps, ablation_metrics, spec$col, spec$levels, pretty = spec$pretty
     )
 
-    p <- bar_with_ci_by_stratum(
+    bar_with_ci_by_stratum(
       boot_df, metric,
       title = paste0("SLAKE ablation ", metric_label(metric),
                      " by ", spec$label, " - ", slice_spec$label)
     )
-
-    panel_w <- if (stratum == "modality") 6 else 8.5
-    ggsave(
-      filename = file.path(
-        SUPP_DIR,
-        paste0("figure-SLAKE-ablation-bars-by-", safe_filename(stratum),
-               "-", metric_filename(metric), "-", safe_filename(slice), ".pdf")
-      ),
-      plot = p, width = panel_w, height = 4.5, device = "pdf", bg = "white"
-    )
-
-    p
   })
 
 walk(ablation_strata_bar_plots, print)

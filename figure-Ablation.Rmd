@@ -19,7 +19,10 @@ knitr::opts_chunk$set(
   fig.height = 12,
   dpi = 600
 )
+```
 
+
+```{r librarys}
 library(tidyverse)
 library(patchwork)
 library(scales)
@@ -32,11 +35,9 @@ FIG_DIR <- "main-figures"
 # Supplementary: per-metric ablation bar+CI panels.
 SUPP_DIR <- file.path("supp-figures", "ablation-figures")
 
-walk(c(FIG_DIR, SUPP_DIR),
-     ~ dir.create(.x, showWarnings = FALSE, recursive = TRUE))
+walk(c(FIG_DIR, SUPP_DIR), ~ dir.create(.x, showWarnings = FALSE, recursive = TRUE))
 
-N_BOOT <- 10000
-SEED <- 42
+N_BOOT <- 10000; SEED <- 42
 
 source("./figure2-helpers.R")
 ```
@@ -115,8 +116,6 @@ make_supp_panels <- function(boot_df, metric_specs, supp_dir,
       p <- p + scale_y_continuous(limits = y_limits,
                                   breaks = seq(y_limits[1], y_limits[2], 0.2))
     }
-    ggsave(file.path(supp_dir, paste0(figure_name, ".pdf")),
-           plot = p, width = 5, height = 4, device = "pdf")
     p
   })
 }
@@ -125,8 +124,6 @@ save_supp_arranged <- function(plots, filename, supp_dir,
                                ncol, nrow, width, height) {
   arr <- ggarrange(plotlist = plots, ncol = ncol, nrow = nrow,
                    common.legend = TRUE, legend = "bottom")
-  ggsave(file.path(supp_dir, filename),
-         plot = arr, width = width, height = height, device = "pdf")
   arr
 }
 ```
@@ -185,9 +182,6 @@ p_abl_mimic <- radar_plot(
   grid_label_size = 2.1
 )
 
-ggsave(file.path(FIG_DIR, "figure4-mimic-cxr-ablation-radar.pdf"),
-       plot = p_abl_mimic, width = 7, height = 7, device = "pdf")
-
 p_abl_iu <- radar_plot(abl_iu_summary, RG_RADAR_METRICS,
                           title = "IU X-ray (RG ablation)")
 
@@ -205,9 +199,6 @@ figure_ablation <- ggarrange(
   labels     = c("A", "B"),
   font.label = list(size = 14, face = "bold")
 )
-
-ggsave(file.path(FIG_DIR, "figure-Ablation.pdf"),
-       plot = figure_ablation, width = 14, height = 12, device = "pdf")
 
 figure_ablation
 ```

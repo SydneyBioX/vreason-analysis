@@ -1,0 +1,228 @@
+---
+title: "VReason reader study — finding retrieval vs number of findings"
+author: "Harry Robertson"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 6.5, fig.height = 4.2, dpi = 300)
+```
+
+```{r libs}
+library(tidyverse)
+library(lme4)
+library(scales)
+
+# ---- helpers (shared with reader-study-novel-findings.Rmd) -------------------
+splitc <- function(x) {
+  str_split(replace_na(as.character(x), ""), ";") |> unlist(use.names = FALSE) |>
+    str_trim() |> (\(v) v[v != ""])()
+}
+# TRUE pathology burden. Two verified GT labeling artifacts are excluded here (audit 2026-06-22,
+# see reader-study-analysis/verification/gt_semantic_audit_2026-06-22.md):
+#   (1) "No Finding" is a token, not a pathology;
+#   (2) "Support Devices" is a device, not a pathology to be retrieved (it is also under-labeled in
+#       the raw GT, present on only 1/12 device cases) — counting it leaked the normal case
+#       cb103846 into the abnormal analysis.
+# `pset()` returns the pathology label SET per response; `npath()` is its size. Working with the
+# sets lets us recompute miss/recovery against the corrected GT in the data chunk below.
+NONPATH <- c("No Finding", "Support Devices")
+pset  <- function(x) str_split(replace_na(as.character(x), ""), ";") |>
+  map(~ setdiff(str_trim(.x[.x != ""]), NONPATH))
+npath <- function(x) lengths(pset(x))
+wilson <- function(k, n, z = 1.96) {                 # returns c(lo, hi) as proportion
+  if (is.na(n) || n == 0) return(c(NA, NA))
+  p <- k / n; d <- 1 + z^2/n
+  c((p + z^2/(2*n))/d - z*sqrt(p*(1-p)/n + z^2/(4*n^2))/d,
+    (p + z^2/(2*n))/d + z*sqrt(p*(1-p)/n + z^2/(4*n^2))/d)
+}
+P <- function(x) signif(x, 3)
+
+COL_VR    <- "#8B1A1A"   # VReason red (reader + VReason)
+COL_NEU   <- "#9CA3AF"   # neutral grey (unaided reader)
+COL_AMBER <- "#E69F00"   # Okabe-Ito orange
+COL_GREEN <- "#009E73"   # Okabe-Ito green
+COL_BLUE  <- "#0072B2"   # Okabe-Ito blue
+theme_set(theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold", size = rel(1.02)),
+        plot.subtitle = element_text(colour = "grey35", size = rel(0.85)),
+        legend.position = "bottom", legend.title = element_blank()))
+```
+
+This is a **reader-study** analysis: the outcome is how many ground-truth findings the *readers*
+retrieve, unaided and then with VReason. We use the **manual arm** (read unaided first, VReason
+revealed second), where `missed_by_human` is the unaided miss count and `recovered_by_AI` is the
+subset of those misses the reader caught after seeing VReason. Each row is one reader×case response;
+cases carry an uneven number of readers (1–7), so all inferential statements come from binomial
+**GLMMs with `(1|user_id)+(1|case_id)`** rather than from collapsing to the case.
+
+```{r data}
+DL  <- "~/Downloads"
+det <- read_csv(file.path(DL, "per_response_detailed.csv"), show_col_types = FALSE)
+
+# Corrected case-level ground truth (audit 2026-06-22): removes 3 phantom "Enlarged
+# Cardiomediastinum" labels whose reports describe a normal mediastinum, and records the
+# Support Devices the raw GT omitted. Keyed on full case_id; new cases from a re-export that are
+# not yet in the key fall back to the raw gt_conditions via coalesce().
+gtkey <- read_csv("reader-study-analysis/verification/gt_conditions_corrected.csv",
+                  show_col_types = FALSE) |>
+  select(case_id, gt_conditions_corrected)
+
+# The miss/recovery counts in the export are exactly  gt − human  and  (gt − human) ∩ humanai
+# (verified label-level, 0/176 mismatches), so we recompute them from the CORRECTED pathology
+# sets rather than trusting the precomputed columns — this propagates the GT fix into the counts.
+man <- det |>
+  left_join(gtkey, by = "case_id") |>
+  mutate(gt_use = coalesce(gt_conditions_corrected, gt_conditions),
+         gt_p   = pset(gt_use),
+         hum_p  = pset(human_conditions),
+         hai_p  = pset(humanai_conditions),
+         npath           = lengths(gt_p),
+         missed_by_human = lengths(map2(gt_p, hum_p, setdiff)),
+         recovered_by_AI = lengths(map2(map2(gt_p, hum_p, setdiff), hai_p, intersect))) |>
+  filter(presentation_mode_raw == "manual", npath > 0, missed_by_human <= npath) |>
+  mutate(caught_h   = npath - missed_by_human,                       # unaided catches
+         caught_hai = pmin(npath, caught_h + recovered_by_AI),       # catches after VReason
+         h_recall   = caught_h / npath,
+         hai_recall = caught_hai / npath,
+         miss_rate  = missed_by_human / npath,
+         bin        = factor(pmin(npath, 3), levels = 1:3, labels = c("1", "2", "3+")))
+
+```
+
+---
+
+## C1 — Unaided vs VReason-assisted recall, by finding count
+
+Share of ground-truth findings the reader retrieves, in finding-count bands, unaided (grey) vs after
+VReason (red). Bars are finding-level Wilson 95% intervals (descriptive); the burden trend is tested
+with a GLMM in the next panels.
+
+```{r C1}
+c1 <- man |> group_by(bin) |>
+  summarise(gt = sum(npath), H = sum(caught_h), HAI = sum(caught_hai), n_resp = n(), .groups = "drop") |>
+  pivot_longer(c(H, HAI), names_to = "arm", values_to = "caught") |>
+  mutate(recall = caught / gt,
+         lo = purrr::map2_dbl(caught, gt, ~ wilson(.x, .y)[1]),
+         hi = purrr::map2_dbl(caught, gt, ~ wilson(.x, .y)[2]),
+         arm = factor(arm, levels = c("H", "HAI"),
+                      labels = c("Unaided reader", "Reader + VReason")))
+ov_h   <- 100 * sum(man$caught_h)   / sum(man$npath)
+ov_hai <- 100 * sum(man$caught_hai) / sum(man$npath)
+
+p_c1 <- ggplot(c1, aes(bin, recall, fill = arm)) +
+  geom_col(position = position_dodge(0.7), width = 0.62, alpha = 0.9) +
+  scale_fill_manual(values = c("Unaided reader" = COL_NEU, "Reader + VReason" = COL_VR)) +
+  scale_y_continuous(labels = label_percent(), limits = c(0, 0.5)) +
+  labs(x = "Ground-truth findings per case  (npath)", y = "Findings retrieved")
+p_c1
+
+ggsave("./figures/reader-study/findingcount_C1.pdf", plot = p_c1, width = 6.5, height = 4.2, device = "pdf", bg = "white")
+```
+
+---
+
+## C2 — Unaided miss rate rises with finding burden
+
+Per response, the fraction of true findings the unaided reader missed, against the finding count.
+The curve is a binomial fit; the odds ratio is from a GLMM that accounts for repeated readers and
+cases.
+
+```{r C2}
+m_c2 <- glmer(cbind(missed_by_human, caught_h) ~ scale(npath) + (1|user_id) + (1|case_id),
+              data = man, family = binomial, control = glmerControl(optimizer = "bobyqa"))
+sc   <- summary(m_c2)$coefficients
+or_c2 <- exp(sc["scale(npath)", 1]); p_c2v <- sc["scale(npath)", 4]
+
+p_c2 <- ggplot(man, aes(npath, miss_rate)) +
+  geom_smooth(method = "glm", method.args = list(family = "binomial"),
+              aes(weight = npath), colour = COL_VR, fill = COL_VR, alpha = 0.12) +
+  geom_jitter(width = 0.12, height = 0.02, alpha = 0.5, colour = COL_NEU, size = 1.5) +
+  scale_x_continuous(breaks = 1:5) +
+  scale_y_continuous(labels = label_percent(), limits = c(-0.05, 1.05)) +
+  labs(title = "C2: Unaided miss rate is flat across finding burden",
+       subtitle = sprintf("GLMM miss OR = %.2f per +1 SD of finding count (p = %.3f, n.s.); readers miss ~3 in 4 findings regardless", or_c2, p_c2v),
+       x = "Ground-truth findings per case  (npath)", y = "Unaided miss rate")
+p_c2
+```
+
+---
+
+## C3 — VReason recovery of missed findings, by burden
+
+Of the findings the reader missed unaided, what fraction did VReason help recover? Restricted to
+responses with at least one miss; point area is the number missed.
+
+```{r C3}
+c3 <- man |> filter(missed_by_human > 0) |>
+  mutate(rec_rate = recovered_by_AI / missed_by_human)
+m_c3 <- glmer(cbind(recovered_by_AI, missed_by_human - recovered_by_AI) ~ scale(npath) +
+                (1|user_id) + (1|case_id),
+              data = c3, family = binomial, control = glmerControl(optimizer = "bobyqa"))
+sc3 <- summary(m_c3)$coefficients
+or_c3 <- exp(sc3["scale(npath)", 1]); p_c3v <- sc3["scale(npath)", 4]
+
+p_c3 <- ggplot(c3, aes(npath, rec_rate)) +
+  geom_smooth(method = "glm", method.args = list(family = "binomial"),
+              aes(weight = missed_by_human), colour = COL_VR, fill = COL_VR, alpha = 0.12) +
+  geom_jitter(aes(size = missed_by_human), width = 0.12, height = 0.02, alpha = 0.5, colour = COL_NEU) +
+  scale_size_continuous(range = c(1.5, 5), name = "findings missed") +
+  scale_x_continuous(breaks = 1:5) +
+  scale_y_continuous(labels = label_percent(), limits = c(-0.05, 1.05)) +
+  labs(title = "C3: VReason recovery rate is roughly constant across burden",
+       subtitle = sprintf("GLMM recovery OR = %.2f per +1 SD of finding count (p = %.3f, n.s.)", or_c3, p_c3v),
+       x = "Ground-truth findings per case  (npath)", y = "Share of missed findings recovered")
+p_c3
+```
+
+---
+
+## C4 — The assistance benefit per response shrinks with burden
+
+The within-response recall gain from VReason (`reader+VReason − unaided`), by finding-count band. The
+dashed line is no benefit; the boxes show the gain is largest on low-burden cases.
+
+```{r C4}
+c4 <- man |> mutate(gain = hai_recall - h_recall)
+gain_by_bin <- c4 |> group_by(bin) |> summarise(mg = mean(gain), n = n(), .groups = "drop")
+
+p_c4 <- ggplot(c4, aes(bin, gain)) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_boxplot(width = 0.55, alpha = 0.4, fill = COL_VR, outlier.shape = NA) +
+  geom_jitter(width = 0.12, height = 0.01, alpha = 0.5, size = 1.4) +
+  geom_text(data = gain_by_bin, aes(bin, 1.02, label = sprintf("+%.0f%%\n(n=%d)", 100*mg, n)),
+            size = 3, lineheight = 0.9, colour = "grey25") +
+  scale_y_continuous(labels = label_percent(), limits = c(-0.2, 1.1)) +
+  labs(title = "C4: Per-case recall gain from VReason, by finding burden",
+       subtitle = "Gain = (reader + VReason) − unaided recall, within the same response",
+       x = "Ground-truth findings per case  (npath)", y = "Recall gain from VReason")
+p_c4
+```
+
+---
+
+> **Scope & caveats.** Manual arm only (the unaided→assisted crossover); `r nrow(man)` responses on
+> `r n_distinct(man$case_id)` abnormal cases. Readers per case are uneven (1–7), which is exactly why
+> the inferential claims use `(1|user_id)+(1|case_id)` GLMMs rather than case-collapsed rates — the
+> bar/point CIs are descriptive (finding-level Wilson). Finding count is near-collinear with the
+> difficulty label (N5 in `reader-study-novel-findings.Rmd`), so read these as the burden axis, not a
+> burden effect isolated from difficulty. Ground truth uses the corrected case-level key
+> (`reader-study-analysis/verification/gt_conditions_corrected.csv`): "No Finding" and "Support
+> Devices" are excluded from the pathology burden, and 3 phantom "Enlarged Cardiomediastinum"
+> labels are dropped; miss/recovery counts are recomputed from the corrected pathology sets and
+> guarded to the burden (`missed_by_human ≤ npath`).
+
+```{r save, include=FALSE}
+dir.create("./figures/reader-study", showWarnings = FALSE, recursive = TRUE)
+walk2(list(p_c1, p_c2, p_c3, p_c4),
+      paste0("./figures/reader-study/findingcount_C", 1:4, ".pdf"),
+      ~ ggsave(.y, plot = .x, width = 6.5, height = 4.2, device = "pdf", bg = "white"))
+```

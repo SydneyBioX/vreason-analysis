@@ -35,7 +35,7 @@ library(ggpubr)
 library(scales)
 library(broom)
 
-set.seed(params$seed)
+source("R/helper.R") # helper functions for plots.
 
 READER_ROOT <- normalizePath(params$reader_root, mustWork = TRUE)
 RESPONSES_ROOT <- file.path(READER_ROOT, "responses")
@@ -52,8 +52,6 @@ walk(c(
   ),
   ~ dir.create(.x, showWarnings = FALSE, recursive = TRUE)
 )
-
-source("./figure2-helpers.R")
 ```
 
 ```{r statistical-helpers}
@@ -78,7 +76,7 @@ pct <- function(n, d) {
   out
 }
 
-wilson_ci <- function(k, n, z = 1.959963984540054) {
+wilson_ci <- function(k, n, z = qnorm(0.975)) {
   if (is.na(n) || n == 0) return(c(NA_real_, NA_real_))
   phat <- k / n
   denom <- 1 + z^2 / n
@@ -443,8 +441,6 @@ p_accept_overall <- ggplot(accept_tbl, aes(status, percentage, fill = status)) +
   guides(fill = "none")
 
 p_accept_overall
-ggsave("./figures/reader-study/finding_acceptance_overall.pdf", p_accept_overall, 
-        width = 4.8, height = 4, device = "pdf", bg = "white")
 ```
 
 ```{r figure-confidence-impact, fig.width=4.8, fig.height=4}
@@ -479,8 +475,7 @@ p_boost_overall
 time_df <- time_df |>
   mutate(
     presentation_mode = factor(presentation_mode, levels = c("manual", "ai_assisted")),
-    mode_label = recode(as.character(presentation_mode), !!!MODE_LABEL)
-  )
+    mode_label = recode(as.character(presentation_mode), !!!MODE_LABEL))
 
 time_summary <- time_df |>
   group_by(presentation_mode) |>
@@ -532,8 +527,6 @@ p_time_mode <- ggplot(time_df, aes(presentation_mode, interpret_time_seconds, fi
   labs(x = NULL, y = "Seconds") + guides(fill = "none", colour = "none")
 
 p_time_mode
-ggsave("./figures/reader-study/interpretation_time_by_mode.pdf", p_time_mode, 
-       width = 4.8, height = 4, device = "pdf")
 ```
 
 ```{r figure-confidence-context, fig.width=7.4, fig.height=4.2}
@@ -649,8 +642,6 @@ p_part_time <- ggplot(time_df_p, aes(participant, interpret_time_seconds, fill =
   coord_flip()
 
 p_part_time
-ggsave("./figures/reader-study/interpretation_time_by_participant.pdf", p_part_time,
-       width = 6, height = 4.5, device = "pdf")
 ```
 
 ```{r figure-participant-decision-confidence, fig.width=9, fig.height=5.2}
@@ -728,8 +719,6 @@ p_part_decision_boost <- ggplot(part_summary_long, aes(participant, percentage, 
   coord_flip()
 
 p_part_decision_boost
-ggsave("./figures/reader-study/decision_confidence_by_participant.pdf", p_part_decision_boost,
-       width = 9, height = 5.2, device = "pdf")
 ```
 
 ```{r figure-participant-acceptance, fig.width=6.4, fig.height=5}
@@ -768,8 +757,6 @@ p_part_accept <- part_accept |>
   coord_flip()
 
 p_part_accept
-ggsave("./figures/reader-study/finding_acceptance_by_participant.pdf", p_part_accept, 
-       width = 6.4, height = 4.8, device = "pdf")
 ```
 
 ```{r figure-difficulty-time, fig.width=7.4, fig.height=4.8}
@@ -857,8 +844,6 @@ p_diff_time <- ggplot(time_df_d, aes(case_difficulty, interpret_time_seconds, fi
   labs(title = "Interpretation time by difficulty", x = NULL, y = "Seconds")
 
 p_diff_time
-ggsave("./figures/reader-study/interpretation_time_by_difficulty.pdf", p_diff_time, 
-       width = 7.4, height = 4.8, device = "pdf")
 ```
 
 ```{r figure-difficulty-outcomes, fig.width=13.2, fig.height=4.2}
@@ -959,15 +944,6 @@ p_diff_decision_boost_accept <- ggarrange(
   align = "hv"
 )
 
-ggsave(
-  file.path(SUPP_DIR, "per_difficulty_decision_boost_acceptance.pdf"),
-  plot = p_diff_decision_boost_accept,
-  width = 13.2,
-  height = 4.2,
-  device = "pdf",
-  bg = "white"
-)
-
 p_diff_decision_boost_accept
 ```
 
@@ -1039,8 +1015,6 @@ p_ai_vs_humanai <- ggplot(ai_metric_long, aes(metric, mean_score, fill = report)
   labs(x = NULL, y = "Mean score") + theme_bw()
 
 p_ai_vs_humanai
-ggsave("./figures/reader-study/human_vs_humanai_report_scores.pdf", p_ai_vs_humanai, 
-       width = 8.2, height = 4.2, device = "pdf")
 ```
 
 ```{r figure-overall-disease-recovery, fig.width=10.4, fig.height=4.4}
@@ -1201,8 +1175,6 @@ p_condition_recovery <- ggplot(disease_condition_tbl, aes(condition, recovery_ra
 p_condition_level <- p_condition_missed + p_condition_recovery + plot_layout(ncol = 2)
 
 p_condition_level
-ggsave("./figures/reader-study/condition_level_recovery.pdf", p_condition_level, 
-       width = 11.2, height = 5.8, device = "pdf")
 ```
 
 ```{r figure-participant-recovery, fig.width=6.8, fig.height=4.6}
@@ -1305,15 +1277,6 @@ figure_readerstudy <- (
     plot.title = element_text(face = "bold", size = 16),
     plot.subtitle = element_text(size = 10, colour = "grey35")
   )
-
-ggsave(
-  file.path(FIG_DIR, "figure-readerstudy.pdf"),
-  plot = figure_readerstudy,
-  width = 16,
-  height = 33,
-  device = "pdf",
-  bg = "white"
-)
 
 figure_readerstudy
 ```
